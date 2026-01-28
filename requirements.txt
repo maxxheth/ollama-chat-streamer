@@ -1,0 +1,5 @@
+ollama
+ddgs
+python-dotenv
+mypy
+types-requests

@@ -1,0 +1,19 @@
+services:
+  chat:
+    build: .
+    volumes:
+      # Mount the current directory so logs are saved to your host machine
+      - ./:/app
+    environment:
+      # Connect to the host's Ollama instance.
+      # With network_mode: host, localhost refers to the host machine.
+      - OLLAMA_HOST=http://localhost:11434
+      
+      # Configurable flags via Env Vars
+    
+# Use host networking to access Ollama on the host machine
+    network_mode: host
+
+    # Keep the container running or allow interactive input
+    stdin_open: true 
+    tty: true
