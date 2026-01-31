@@ -65,11 +65,17 @@ Configuration can be done via:
 | ------------------------ | -------------------------------------------- | ------------------------ |
 | `OLLAMA_HOST`            | URL of your Ollama instance                  | `http://localhost:11434` |
 | `OLLAMA_MODEL`           | Model to use (e.g., llama3, mistral)         | `llama3`                 |
+| `OLLAMA_MODEL_FALLBACKS` | Comma-separated fallback models              | (empty)                  |
 | `CHAT_LOG_DEST`          | Path to chat log file                        | `chat_log.txt`           |
 | `EXPERIMENTAL`           | Enable experimental features                 | `false`                  |
 | `EXPERIMENTAL_WEBSEARCH` | Enable intelligent web search                | `false`                  |
 | `CONTEXT_PATH`           | Path to file/directory for context loading   | (empty)                  |
 | `CONTEXT_GREP`           | File extensions to include (comma-separated) | `txt,log`                |
+| `RETRY_MAX_ATTEMPTS`     | Max retry attempts for Ollama calls          | `3`                      |
+| `RETRY_INITIAL_DELAY`    | Initial backoff delay in seconds             | `0.5`                    |
+| `RETRY_MAX_DELAY`        | Max backoff delay in seconds                 | `8.0`                    |
+| `RETRY_MULTIPLIER`       | Backoff multiplier                           | `2.0`                    |
+| `RETRY_JITTER`           | Jitter ratio applied to backoff delay        | `0.1`                    |
 
 ### Command-Line Flags
 
@@ -83,6 +89,13 @@ Options:
   --experimental-websearch  Enable intelligent web search
   --context TEXT            Path to context file or directory
   --context-grep TEXT       File extensions to include (e.g., "js,ts,py")
+  --model-fallbacks TEXT    Comma-separated fallback models
+  --retry-max-attempts INT  Max retry attempts for Ollama calls
+  --retry-initial-delay FLOAT
+                            Initial backoff delay in seconds
+  --retry-max-delay FLOAT   Max backoff delay in seconds
+  --retry-multiplier FLOAT  Backoff multiplier
+  --retry-jitter FLOAT      Jitter ratio applied to backoff delay
 ```
 
 ## Usage Examples
@@ -97,6 +110,19 @@ python stream_chat.py
 
 ```bash
 python stream_chat.py --model codellama
+```
+
+### Use Fallback Models and Tweak Retry Settings
+
+```bash
+python stream_chat.py \
+  --model llama3 \
+  --model-fallbacks "mistral,codellama" \
+  --retry-max-attempts 4 \
+  --retry-initial-delay 0.75 \
+  --retry-max-delay 10 \
+  --retry-multiplier 2 \
+  --retry-jitter 0.2
 ```
 
 ### Enable Intelligent Web Search
