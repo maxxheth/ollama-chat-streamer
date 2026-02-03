@@ -5,8 +5,10 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install system dependencies (if any needed)
+# Install build dependencies required by psycopg2-binary (needs libpq headers)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the requirements file into the container
