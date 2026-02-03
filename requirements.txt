@@ -3,3 +3,5 @@ ddgs
 python-dotenv
 mypy
 types-requests
+psycopg2-binary
+asyncpg
