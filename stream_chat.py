@@ -15,6 +15,16 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+# ==============================
+# DATABASE INTEGRATION SECTION
+# ==============================
+# Import database module
+try:
+    from db import get_database_manager, Conversation
+    HAS_DB = True
+except ImportError:
+    HAS_DB = False
+
 # Attempt to import DuckDuckGo for web search
 try:
     from ddgs import DDGS  # type: ignore
@@ -351,7 +361,14 @@ def parse_arguments() -> argparse.Namespace:
         "--context",
         type=str,
         default=os.environ.get("CONTEXT_PATH", ""),
-        help="Path to a directory or file to load as historical context for the LLM"
+        help="Path to a directory or file to load as historical context for the LLM. Use 'db' to load from database."
+    )
+
+    parser.add_argument(
+        "--persist-to-db",
+        action="store_true",
+        default=os.environ.get("PERSIST_TO_DB", "false").lower() == "true",
+        help="Enable saving conversations to PostgreSQL database"
     )
 
     parser.add_argument(
@@ -662,6 +679,79 @@ def load_context_files(context_path: str, extensions: List[str]) -> str:
     return "\n".join(context_parts)
 
 
+def load_context_from_database(
+    db_manager, 
+    additional_paths: Optional[List[str]] = None,
+    limit: Optional[int] = None
+) -> str:
+    """
+    Load context from database and optionally from additional file paths.
+    
+    Args:
+        db_manager: Database manager instance
+        additional_paths: Additional file/directory paths to load context from
+        limit: Maximum number of conversations to load from database
+        
+    Returns:
+        Concatenated context from database and files
+    """
+    context_parts = []
+    
+    # Load from database
+    try:
+        conversations = db_manager.get_all_conversations(limit=limit)
+        if conversations:
+            context_parts.append("=== Database Conversations ===\n")
+            for conv in conversations:
+                context_parts.append(f"--- Conversation {conv.id} (Model: {conv.model}, Created: {conv.created_at}) ---\n")
+                for msg in conv.messages:
+                    if msg.get('role') in ['user', 'assistant']:
+                        role = msg.get('role', 'unknown').upper()
+                        content = msg.get('content', '')
+                        context_parts.append(f"{role}: {content}\n")
+                context_parts.append("\n")
+    except Exception as e:
+        context_parts.append(f"=== Error loading from database: {e} ===\n")
+    
+    # Load from additional paths
+    if additional_paths:
+        for path in additional_paths:
+            if path and path != 'db':
+                content = load_context_files(path, ['txt', 'log'])
+                if content:
+                    context_parts.append(f"=== File Context: {path} ===\n{content}\n")
+    
+    return "\n".join(context_parts)
+
+
+def parse_context_arg(context_arg: str) -> Dict[str, Any]:
+    """
+    Parse the --context argument to extract database and file paths.
+    
+    Args:
+        context_arg: The context argument value
+        
+    Returns:
+        Dictionary with 'use_db' boolean and 'paths' list of additional paths
+    """
+    if not context_arg:
+        return {'use_db': False, 'paths': []}
+    
+    # Split by comma to handle multiple sources
+    parts = [part.strip() for part in context_arg.split(',')]
+    
+    use_db = False
+    paths = []
+    
+    for part in parts:
+        if part.lower() == 'db':
+            use_db = True
+        elif part:
+            paths.append(part)
+    
+    return {'use_db': use_db, 'paths': paths}
+
+
 def _get_retry_config_from_args(args: argparse.Namespace) -> RetryConfig:
     return RetryConfig(
         max_attempts=max(1, args.retry_max_attempts),
@@ -754,22 +844,66 @@ def main() -> None:
         print("Error: No models could be loaded. Exiting.")
         return
 
+    # Initialize database manager if needed
+    db_manager = None
+    if args.persist_to_db:
+        if not HAS_DB:
+            print("Error: Database dependencies not installed. Run: pip install psycopg2-binary asyncpg")
+            return
+    
+    try:
+        db_manager = get_database_manager(sync=True)
+        # Create tables if they don't exist
+        db_manager.create_tables()
+        print("[Database] Tables created/verified successfully")
+    except Exception as e:
+        print(f"Error connecting to database: {e}")
+        print("Tip: Ensure PostgreSQL is running and DATABASE_URL is set correctly")
+        return
+
     # Initialize chat history
     messages: List[Dict[str, str]] = []
+    
+    # Parse context argument
+    context_config = parse_context_arg(args.context)
     
     # Load context if provided
     context_content = ""
     if args.context:
-        extensions = [ext.strip() for ext in args.context_grep.split(',')]
-        context_content = load_context_files(args.context, extensions)
-        if context_content:
-            # Add context as a system message
-            messages.append({
-                "role": "system",
-                "content": f"You have access to the following context files:\n\n{context_content}"
-            })
-            print(f"[Loaded context from: {args.context}]")
-            print(f"[File extensions: {', '.join(extensions)}]")
+        if context_config['use_db']:
+            # Load from database
+            if db_manager is None:
+                print("Error: Cannot load from database without --persist-to-db flag")
+                return
+            
+            try:
+                context_content = load_context_from_database(
+                    db_manager, 
+                    additional_paths=context_config['paths']
+                )
+                if context_content:
+                    # Add context as a system message
+                    messages.append({
+                        "role": "system",
+                        "content": f"You have access to the following context:\n\n{context_content}"
+                    })
+                    print(f"[Loaded context from database]")
+                    if context_config['paths']:
+                        print(f"[Also loaded context from: {', '.join(context_config['paths'])}]")
+            except Exception as e:
+                print(f"Error loading context from database: {e}")
+        else:
+            # Load from files only
+            extensions = [ext.strip() for ext in args.context_grep.split(',')]
+            context_content = load_context_files(args.context, extensions)
+            if context_content:
+                # Add context as a system message
+                messages.append({
+                    "role": "system",
+                    "content": f"You have access to the following context files:\n\n{context_content}"
+                })
+                print(f"[Loaded context from: {args.context}]")
+                print(f"[File extensions: {', '.join(extensions)}]")
     
     print(f"Starting chat with {available_models[0]}.")
     if len(available_models) > 1:
@@ -777,7 +911,8 @@ def main() -> None:
     print(f"Experimental Mode: {'ON' if args.experimental else 'OFF'}")
     print(f"Intelligent Web Search: {'ON (LLM decides when to search)' if args.experimental_websearch else 'OFF'}")
     if args.context:
-        print(f"Context Path: {args.context}")
+        print(f"Context: {args.context}")
+    print(f"Database Persistence: {'ON' if args.persist_to_db else 'OFF'}")
     print(f"Conversation is being saved to: {os.path.abspath(args.dest)}\n")
     print("Type 'exit' or 'quit' to stop.\n")
 
@@ -796,10 +931,13 @@ def main() -> None:
                 header += f"FALLBACKS: {', '.join(available_models[1:])}\n"
             if args.context:
                 header += f"CONTEXT: {args.context}\n"
+            if args.persist_to_db:
+                header += f"DB_PERSIST: true\n"
             header += f"{'='*30}\n"
             log_to_file(f, header)
 
             current_model_index = 0
+            conversation_id = None  # Track database conversation ID
 
             while True:
                 try:
@@ -839,6 +977,30 @@ def main() -> None:
                     # Add final newline to file and history
                     log_to_file(f, "\n")
                     messages.append({"role": "assistant", "content": full_response})
+                    
+                    # Save to database if enabled
+                    if args.persist_to_db and db_manager:
+                        try:
+                            flags = {
+                                'experimental': args.experimental,
+                                'experimental_websearch': args.experimental_websearch,
+                                'model_fallbacks': model_fallbacks,
+                                'context': args.context
+                            }
+                            
+                            if conversation_id is None:
+                                # Save new conversation
+                                conversation_id = db_manager.save_conversation(
+                                    model=used_model,
+                                    messages=messages.copy(),
+                                    flags=flags
+                                )
+                                print(f"[Saved conversation to database with ID: {conversation_id}]")
+                            else:
+                                # Update existing conversation
+                                db_manager.update_conversation(conversation_id, messages.copy())
+                        except Exception as e:
+                            print(f"[Warning] Failed to save to database: {e}")
 
                 except KeyboardInterrupt:
                     print("\n\nChat interrupted by user.")
@@ -852,6 +1014,15 @@ def main() -> None:
 
     except IOError as e:
         print(f"Error opening log file {args.dest}: {e}")
+    
+    finally:
+        # Close database connection if used
+        if db_manager:
+            try:
+                db_manager.close()
+            except:
+                pass
 
 if __name__ == "__main__":
     main()
+# Database integration complete. Conversations can now be persisted to PostgreSQL with --persist-to-db flag and loaded with --context db.
