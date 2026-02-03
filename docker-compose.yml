@@ -4,16 +4,31 @@ services:
     volumes:
       # Mount the current directory so logs are saved to your host machine
       - ./:/app
-    environment:
-      # Connect to the host's Ollama instance.
-      # With network_mode: host, localhost refers to the host machine.
-      - OLLAMA_HOST=http://localhost:11434
-      
-      # Configurable flags via Env Vars
-    
-# Use host networking to access Ollama on the host machine
+    # Use the host network so the container can reach services on the host
+    # (e.g., the Ollama server running on localhost:11434).
     network_mode: host
-
-    # Keep the container running or allow interactive input
-    stdin_open: true 
+    environment:
+      # Connect to the Ollama instance that is running on the host.
+      - OLLAMA_HOST=http://localhost:11434
+      # Database configuration (still points to the internal postgres container)
+      - DATABASE_URL=postgresql://postgres:postgres@localhost:5432/chatdb
+      # Configurable flags via Env Vars
+    stdin_open: true
     tty: true
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=chatdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+
+volumes:
+  postgres_data:
