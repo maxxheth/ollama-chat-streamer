@@ -1,0 +1,37 @@
+services:
+  chat:
+    build: .
+    volumes:
+      # Mount the current directory so logs are saved to your host machine
+      - ./:/app
+    environment:
+      # Connect to the Ollama service defined in this compose file.
+      - OLLAMA_HOST=http://ollama:11434
+      # Database configuration
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/chatdb
+      # Configurable flags via Env Vars
+    stdin_open: true
+    tty: true
+    depends_on:
+      - postgres
+      - ollama
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=chatdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
