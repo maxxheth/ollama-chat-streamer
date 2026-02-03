@@ -7,8 +7,9 @@ A feature-rich CLI chat interface for Ollama with streaming responses, intellige
 - 🚀 **Streaming Responses** - Real-time token-by-token output from Ollama models
 - 🔍 **Intelligent Web Search** - LLM decides when to search the web for current information
 - 📁 **Context Loading** - Load files or entire directories as conversation context
+- �️ **Database Persistence** - Optional PostgreSQL storage for conversation history
 - 📝 **Chat Logging** - Automatically saves all conversations to a log file
-- 🐳 **Docker Support** - Easy containerized deployment
+- 🐳 **Docker Support** - Easy containerized deployment with PostgreSQL
 - ⚙️ **Environment Configuration** - Flexible configuration via CLI flags or .env file
 
 ## Quick Start
@@ -71,6 +72,8 @@ Configuration can be done via:
 | `EXPERIMENTAL_WEBSEARCH` | Enable intelligent web search                | `false`                  |
 | `CONTEXT_PATH`           | Path to file/directory for context loading   | (empty)                  |
 | `CONTEXT_GREP`           | File extensions to include (comma-separated) | `txt,log`                |
+| `PERSIST_TO_DB`          | Enable database persistence                  | `false`                  |
+| `DATABASE_URL`           | PostgreSQL connection URL                    | (empty)                  |
 | `RETRY_MAX_ATTEMPTS`     | Max retry attempts for Ollama calls          | `3`                      |
 | `RETRY_INITIAL_DELAY`    | Initial backoff delay in seconds             | `0.5`                    |
 | `RETRY_MAX_DELAY`        | Max backoff delay in seconds                 | `8.0`                    |
@@ -87,8 +90,9 @@ Options:
   --dest TEXT               Path to the log file
   --experimental            Enable experimental features
   --experimental-websearch  Enable intelligent web search
-  --context TEXT            Path to context file or directory
+  --context TEXT            Path to context file or directory (use 'db' for database)
   --context-grep TEXT       File extensions to include (e.g., "js,ts,py")
+  --persist-to-db           Enable saving conversations to PostgreSQL database
   --model-fallbacks TEXT    Comma-separated fallback models
   --retry-max-attempts INT  Max retry attempts for Ollama calls
   --retry-initial-delay FLOAT
@@ -164,6 +168,60 @@ python stream_chat.py \
   --dest ./logs/my_chat.log
 ```
 
+### Database Persistence
+
+Enable PostgreSQL storage for your conversations:
+
+```bash
+# Start with database persistence
+python stream_chat.py --persist-to-db
+
+# Load past conversations from database
+python stream_chat.py --context db
+
+# Load from database + additional file paths
+python stream_chat.py --context "db,./notes,./docs"
+
+# Use environment variables
+export PERSIST_TO_DB=true
+export DATABASE_URL="postgresql://user:password@localhost:5432/chatdb"
+python stream_chat.py
+```
+
+#### Database Setup
+
+1. **Using Docker Compose (Recommended)**:
+
+   ```bash
+   docker-compose up -d postgres
+   python setup_db.py
+   ```
+
+2. **Manual Setup**:
+
+   ```bash
+   # Install PostgreSQL and create database
+   createdb chatdb
+
+   # Set DATABASE_URL environment variable
+   export DATABASE_URL="postgresql://postgres:password@localhost:5432/chatdb"
+
+   # Initialize database
+   python setup_db.py
+   ```
+
+3. **Check database status**:
+   ```bash
+   python setup_db.py info
+   ```
+
+#### Database Features
+
+- **Automatic Conversation Saving**: When `--persist-to-db` is enabled, each conversation is saved with metadata (model, flags, timestamps)
+- **Context Loading**: Use `--context db` to load all past conversations as context
+- **Mixed Context**: Combine database and file sources: `--context "db,./docs,./notes"`
+- **Query History**: Use `setup_db.py info` to view conversation statistics
+
 ## Docker Networking
 
 ### Linux
@@ -188,10 +246,12 @@ OLLAMA_HOST=http://host.docker.internal:11434
 
 ```
 .
-├── docker-compose.yml      # Docker Compose configuration
+├── docker-compose.yml      # Docker Compose configuration with PostgreSQL
 ├── Dockerfile              # Docker image definition
-├── requirements.txt        # Python dependencies
+├── requirements.txt        # Python dependencies (including database drivers)
 ├── stream_chat.py          # Main application
+├── db.py                   # Database module for PostgreSQL operations
+├── setup_db.py             # Database initialization script
 ├── .env.example            # Example environment configuration
 ├── .gitignore             # Git ignore rules
 └── chat_log.txt           # Default chat log (created on first run)
