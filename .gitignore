@@ -1,4 +1,5 @@
 sessions
+data
 .env
 __pycache__
 .env.swp
