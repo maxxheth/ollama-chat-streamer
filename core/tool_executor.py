@@ -15,7 +15,13 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-# ``HAS_DDG`` is defined in ``stream_chat.py`` before this module is imported.
+# DuckDuckGo web search tool (optional)
+try:
+    from ddgs import DDGS
+    HAS_DDG = True
+except ImportError:
+    HAS_DDG = False
+
 
 def get_tools() -> List[Dict[str, Any]]:
     """Return the list of available tools for the model."""

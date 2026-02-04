@@ -90,7 +90,7 @@ def load_context_files(context_path: str, extensions: List[str]) -> str:
 
 
 def load_context_from_database(
-    db_manager, 
+    db_manager: Any, 
     additional_paths: Optional[List[str]] = None,
     limit: Optional[int] = None
 ) -> str:

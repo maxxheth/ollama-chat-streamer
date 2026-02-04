@@ -8,6 +8,7 @@ makes the entry‑point smaller and improves testability.
 import os
 import argparse
 from typing import List
+from pathlib import Path
 
 
 def _parse_env_int(name: str, default: int) -> int:

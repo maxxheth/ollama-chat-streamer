@@ -14,12 +14,19 @@ from pathlib import Path
 
 # Optional interactive menu library
 try:
-    import questionary  # type: ignore
+    import questionary
     HAS_QUESTIONARY = True
 except ImportError:
     HAS_QUESTIONARY = False
 
 # Database integration (optional)
+from typing import List, Optional, Dict, Any, TextIO
+from pathlib import Path
+import sys
+import json
+import csv
+import textwrap
+
 try:
     from db import get_database_manager, Conversation
     HAS_DB = True
@@ -27,15 +34,15 @@ except ImportError:
     HAS_DB = False
 
 
-def list_sessions() -> None:
+async def list_sessions() -> None:
     """List all saved conversation sessions and exit."""
     if not HAS_DB:
         print("Error: Database dependencies not installed. Run: pip install psycopg2-binary asyncpg")
         return
 
     dbm = get_database_manager(sync=True)
-    dbm.create_tables()
-    sessions = dbm.get_all_conversations()
+    await dbm.create_tables()
+    sessions = await dbm.get_all_conversations()
     
     if not sessions:
         print("No saved sessions found.")
@@ -45,7 +52,7 @@ def list_sessions() -> None:
         print(f"ID: {conv.id} | Model: {conv.model} | Created: {conv.created_at}")
 
 
-def select_session() -> Optional[List[Dict[str, str]]]:
+async def select_session() -> Optional[List[Dict[str, str]]]:
     """Interactively select a saved session to continue.
     
     Returns:
@@ -56,8 +63,8 @@ def select_session() -> Optional[List[Dict[str, str]]]:
         return None
 
     dbm = get_database_manager(sync=True)
-    dbm.create_tables()
-    sessions = dbm.get_all_conversations()
+    await dbm.create_tables()
+    sessions = await dbm.get_all_conversations()
     
     if not sessions:
         print("No saved sessions found.")
@@ -80,7 +87,7 @@ def select_session() -> Optional[List[Dict[str, str]]]:
             return None
     
     selected_id = int(answer.split(":")[0])
-    conv = dbm.get_conversation(selected_id)
+    conv = await dbm.get_conversation(selected_id)
     
     if conv is None:
         print(f"Conversation {selected_id} not found.")
@@ -90,7 +97,7 @@ def select_session() -> Optional[List[Dict[str, str]]]:
     return conv.messages
 
 
-def export_session(session_id: int, output_format: str = "json", output_target: Optional[TextIO] = None) -> None:
+async def export_session(session_id: int, output_format: str = "json", output_target: Optional[TextIO] = None) -> None:
     """Export a conversation session in the specified format.
     
     Args:
@@ -103,8 +110,8 @@ def export_session(session_id: int, output_format: str = "json", output_target: 
         return
 
     dbm = get_database_manager(sync=True)
-    dbm.create_tables()
-    conv = dbm.get_conversation(session_id)
+    await dbm.create_tables()
+    conv = await dbm.get_conversation(session_id)
     
     if conv is None:
         print(f"Conversation {session_id} not found.")
@@ -146,4 +153,4 @@ def export_session(session_id: int, output_format: str = "json", output_target: 
     
     finally:
         if output_target is not None and output_target is not sys.stdout:
-            output_target.close()
+            out_target.close()

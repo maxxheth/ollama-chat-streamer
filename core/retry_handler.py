@@ -11,6 +11,31 @@ import random
 from dataclasses import dataclass
 from typing import Callable, Any, Optional, Iterable, Dict, List
 
+# Import Ollama client; provide a lightweight stub if the package is missing.
+from typing import Any, Dict, Iterable
+
+try:
+    import ollama
+    from ollama import ChatResponse
+except ImportError:  # pragma: no cover
+    class _OllamaStub:
+        @staticmethod
+        def chat(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+            raise NotImplementedError("ollama package is not installed")
+
+        @staticmethod
+        def show(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+            raise NotImplementedError("ollama package is not installed")
+
+        @staticmethod
+        def pull(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+            raise NotImplementedError("ollama package is not installed")
+
+    class ChatResponse:
+        pass
+
+    ollama: Any = _OllamaStub()
+
 
 @dataclass(frozen=True)
 class RetryConfig:
@@ -97,6 +122,7 @@ def _stream_chat_with_retry(
         try:
             stream = ollama.chat(model=model, messages=messages, stream=True, **kwargs)
             for chunk in stream:
+                yield dict(chunk)  # type: ignore
                 yield chunk
             return
         except Exception as exc:

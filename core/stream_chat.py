@@ -1,21 +1,39 @@
 # Import Ollama client; provide a lightweight stub if the package is missing.
+from typing import Any, Dict, List, Optional, TextIO, Iterable
+
 try:
     import ollama
+    from ollama import ChatResponse
+    from ollama import Message as OllamaMessage
+    from ollama import ToolCall as OllamaToolCall
+    from ollama import FunctionCall as OllamaFunctionCall
 except ImportError:  # pragma: no cover
     class _OllamaStub:
         @staticmethod
-        def chat(*args, **kwargs):
+        def chat(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             raise NotImplementedError("ollama package is not installed")
 
         @staticmethod
-        def show(*args, **kwargs):
+        def show(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             raise NotImplementedError("ollama package is not installed")
 
         @staticmethod
-        def pull(*args, **kwargs):
+        def pull(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             raise NotImplementedError("ollama package is not installed")
 
-    ollama = _OllamaStub()
+    class ChatResponse:
+        pass
+    
+    class OllamaMessage:
+        pass
+    
+    class OllamaToolCall:
+        pass
+    
+    class OllamaFunctionCall:
+        pass
+
+    ollama: Any = _OllamaStub()
 
 # Tool handling moved to core.tool_executor
 from typing import List, Optional, Dict, Any, TextIO, Callable, Iterable
@@ -35,7 +53,9 @@ from core.tool_executor import (
     perform_web_search,
     read_json_file,
 )
+from core.argument_parser import parse_arguments
 from core.context_loader import parse_context_arg, load_context_files, load_context_from_database
+from core.session_manager import list_sessions, select_session, export_session
 # Implement chat_with_tools locally to avoid importing the top‑level script (which requires the optional ``ollama`` package).
 def chat_with_tools(
     model: str,
@@ -62,21 +82,22 @@ def chat_with_tools(
         print(f"\n[Tool calls detected: {[tc.function.name for tc in message.tool_calls]}]")
 
         # Append assistant request to history
-        messages.append({
-            "role": "assistant",
-            "content": message.content or "",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in message.tool_calls
-            ],
-        })
+        if hasattr(message, 'tool_calls') and message.tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in message.tool_calls
+                ],
+            })
 
         # Execute each tool call and add results
         for tool_call in message.tool_calls:
@@ -149,34 +170,6 @@ def _ensure_model_available(model: str, config: RetryConfig) -> None:
             return ollama.pull(model)
         _retry_call(pull_model, config)
 
-def load_context_files(context_path: str, extensions: List[str]) -> str:
-    """Load text content from a file or recursively from a directory matching extensions."""
-    if not context_path or not os.path.exists(context_path):
-        return ""
-    context_parts: List[str] = []
-    extensions = [ext.lstrip('.').lower() for ext in extensions]
-    if os.path.isfile(context_path):
-        try:
-            with open(context_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-                context_parts.append(f"=== File: {context_path} ===\n{content}\n")
-        except Exception as e:
-            context_parts.append(f"=== Error reading {context_path}: {e} ===\n")
-    else:
-        for root, _, files in os.walk(context_path):
-            for file in files:
-                ext = file.split('.')[-1].lower() if '.' in file else ''
-                if ext in extensions or '*' in extensions:
-                    file_path = os.path.join(root, file)
-                    try:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                            rel_path = os.path.relpath(file_path, context_path)
-                            context_parts.append(f"=== File: {rel_path} ===\n{content}\n")
-                    except Exception as e:
-                        context_parts.append(f"=== Error reading {file_path}: {e} ===\n")
-    return "\n".join(context_parts)
-
 def log_to_file(file_handle: TextIO, text: str) -> None:
     """Write text to the given file handle and flush immediately."""
     file_handle.write(text)
@@ -184,14 +177,14 @@ def log_to_file(file_handle: TextIO, text: str) -> None:
 
 # Optional interactive menu library
 try:
-    import questionary  # type: ignore
+    import questionary
     HAS_QUESTIONARY = True
 except ImportError:
     HAS_QUESTIONARY = False
 
 # Optional DuckDuckGo web search tool
 try:
-    from ddgs import DDGS  # type: ignore
+    from ddgs import DDGS
     HAS_DDG = True
 except ImportError:
     HAS_DDG = False
@@ -279,7 +272,7 @@ def _respond_with_fallbacks(
         raise last_error
     raise RuntimeError("No available models to respond.")
 
-def main() -> None:
+async def main() -> None:
     args = parse_arguments()
 
     # ------------------------------------------------------------
@@ -290,7 +283,7 @@ def main() -> None:
         return
 
     if args.select_session:
-        messages = select_session()
+        messages = await select_session()
         if messages is None:
             return
         # Pre‑populate messages with saved conversation and continue
@@ -334,7 +327,7 @@ def main() -> None:
     try:
         db_manager = get_database_manager(sync=True)
         # Create tables if they don't exist
-        db_manager.create_tables()
+        await db_manager.create_tables()
         print("[Database] Tables created/verified successfully")
     except Exception as e:
         print(f"Error connecting to database: {e}")
@@ -342,11 +335,14 @@ def main() -> None:
         return
 
     # Initialize chat history (use preloaded messages if a session was selected)
+    messages: List[Dict[str, str]] = []
     try:
         # _preloaded_messages is set only when --select-session was used
-        messages: List[Dict[str, str]] = _preloaded_messages  # type: ignore
+        preloaded_messages = _preloaded_messages  # type: ignore
+        if preloaded_messages:
+            messages = preloaded_messages
     except NameError:
-        messages: List[Dict[str, str]] = []
+        pass
     
     # Load context if provided
     context_content = ""
@@ -448,7 +444,7 @@ def main() -> None:
                             
                             if conversation_id is None:
                                 # Save new conversation
-                                conversation_id = db_manager.save_conversation(
+                                conversation_id = await db_manager.save_conversation(
                                     model=used_model,
                                     messages=messages.copy(),
                                     flags=flags
@@ -456,7 +452,7 @@ def main() -> None:
                                 print(f"[Saved conversation to database with ID: {conversation_id}]")
                             else:
                                 # Update existing conversation
-                                db_manager.update_conversation(conversation_id, messages.copy())
+                                await db_manager.update_conversation(conversation_id, messages.copy())
                         except Exception as e:
                             print(f"[Warning] Failed to save to database: {e}")
 
@@ -482,5 +478,6 @@ def main() -> None:
                 pass
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
 # Database integration complete. Conversations can now be persisted to PostgreSQL with --persist-to-db flag and loaded with --context db.
