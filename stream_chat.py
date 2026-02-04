@@ -3,6 +3,7 @@ import sys
 import os
 import argparse
 import json
+import csv
 import glob
 import time
 import random
@@ -11,6 +12,14 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Dict, TextIO, Any, Optional, Callable, Iterable
 from dotenv import load_dotenv
+import textwrap
+
+# Optional nice interactive menu library. If unavailable we fall back to a simple prompt.
+try:
+    import questionary  # type: ignore
+    HAS_QUESTIONARY = True
+except ImportError:
+    HAS_QUESTIONARY = False
 
 # Load environment variables from .env file
 load_dotenv()
@@ -369,6 +378,38 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         default=os.environ.get("PERSIST_TO_DB", "false").lower() == "true",
         help="Enable saving conversations to PostgreSQL database"
+    )
+
+    # -----------------------------------------------------------------
+    # New session handling / export options
+    # -----------------------------------------------------------------
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="List saved conversation sessions and exit"
+    )
+    parser.add_argument(
+        "--select-session",
+        action="store_true",
+        help="Interactively select a saved session to continue"
+    )
+    parser.add_argument(
+        "--export-session",
+        type=int,
+        metavar="ID",
+        help="Export the conversation with the given ID. Use --format to choose output format."
+    )
+    parser.add_argument(
+        "--format",
+        choices=["sql", "json", "csv", "text"],
+        default="json",
+        help="Export format when using --export-session"
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="File path to write exported data. If omitted, prints to stdout."
     )
 
     parser.add_argument(
@@ -827,6 +868,93 @@ def _respond_with_fallbacks(
 def main() -> None:
     args = parse_arguments()
 
+    # ------------------------------------------------------------
+    # Session handling commands (list, select, export)
+    # ------------------------------------------------------------
+    if args.list_sessions:
+        dbm = get_database_manager(sync=True)
+        dbm.create_tables()
+        sessions = dbm.get_all_conversations()
+        for conv in sessions:
+            print(f"ID: {conv.id} | Model: {conv.model} | Created: {conv.created_at}")
+        return
+
+    if args.select_session:
+        dbm = get_database_manager(sync=True)
+        dbm.create_tables()
+        sessions = dbm.get_all_conversations()
+        if not sessions:
+            print("No saved sessions found.")
+            return
+        choices = [f"{c.id}: {c.model} ({c.created_at})" for c in sessions]
+        if HAS_QUESTIONARY:
+            answer = questionary.select("Select a conversation to continue:", choices=choices).ask()
+        else:
+            print("Select a conversation to continue:")
+            for i, choice in enumerate(choices, 1):
+                print(f"{i}) {choice}")
+            sel = input("Enter number: ")
+            try:
+                idx = int(sel) - 1
+                answer = choices[idx]
+            except Exception:
+                print("Invalid selection.")
+                return
+        selected_id = int(answer.split(":")[0])
+        conv = dbm.get_conversation(selected_id)
+        if conv is None:
+            print(f"Conversation {selected_id} not found.")
+            return
+        # Pre‑populate messages with saved conversation and continue
+        messages = conv.messages
+        print(f"Resuming conversation ID {selected_id} (model={conv.model})")
+        # Skip the rest of the initialization that would create a new DB manager
+        db_manager = dbm
+        # Continue to the chat loop with pre‑loaded messages
+        # (the rest of main() will use the `messages` variable defined later)
+        # We'll set a flag to indicate we already loaded messages.
+        _preloaded_messages = messages
+        # Jump to after the DB init block by using a guard later.
+        pass
+
+    if args.export_session is not None:
+        dbm = get_database_manager(sync=True)
+        dbm.create_tables()
+        conv = dbm.get_conversation(args.export_session)
+        if conv is None:
+            print(f"Conversation {args.export_session} not found.")
+            return
+        out_target = sys.stdout if args.output is None else args.output.open("w", encoding="utf-8")
+        if args.format == "json":
+            json.dump({
+                "id": conv.id,
+                "model": conv.model,
+                "flags": conv.flags,
+                "messages": conv.messages,
+                "created_at": conv.created_at.isoformat() if conv.created_at else None,
+                "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+            }, out_target, indent=2)
+        elif args.format == "csv":
+            writer = csv.writer(out_target)
+            writer.writerow(["role", "content"])
+            for msg in conv.messages:
+                writer.writerow([msg.get("role", ""), msg.get("content", "")])
+        elif args.format == "text":
+            for msg in conv.messages:
+                out_target.write(f"{msg.get('role', '')}: {msg.get('content', '')}\n\n")
+        elif args.format == "sql":
+            sql = textwrap.dedent(f"""
+                INSERT INTO conversations (id, model, flags, messages, created_at, updated_at)
+                VALUES ({conv.id}, '{conv.model}', '{json.dumps(conv.flags)}', '{json.dumps(conv.messages)}',
+                '{conv.created_at.isoformat() if conv.created_at else None}',
+                '{conv.updated_at.isoformat() if conv.updated_at else None}');
+            """)
+            out_target.write(sql)
+        if args.output is not None:
+            out_target.close()
+        print(f"Conversation {args.export_session} exported as {args.format}.")
+        return
+
     retry_config = _get_retry_config_from_args(args)
     model_fallbacks = _parse_comma_list(args.model_fallbacks)
     model_candidates = _build_model_list(args.model, model_fallbacks)
@@ -861,8 +989,12 @@ def main() -> None:
         print("Tip: Ensure PostgreSQL is running and DATABASE_URL is set correctly")
         return
 
-    # Initialize chat history
-    messages: List[Dict[str, str]] = []
+    # Initialize chat history (use preloaded messages if a session was selected)
+    try:
+        # _preloaded_messages is set only when --select-session was used
+        messages: List[Dict[str, str]] = _preloaded_messages  # type: ignore
+    except NameError:
+        messages: List[Dict[str, str]] = []
     
     # Parse context argument
     context_config = parse_context_arg(args.context)
