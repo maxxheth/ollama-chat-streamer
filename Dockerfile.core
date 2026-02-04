@@ -1,0 +1,31 @@
+# Dockerfile for the refactored Ollama Chat Streamer (core package)
+#
+# This image includes MyPy for type checking and runs the refactored
+# core/stream_chat.py entry point.
+
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install MyPy for type checking
+RUN pip install --no-cache-dir mypy
+
+# Copy the entire project
+COPY . .
+
+# Ensure the core package is discoverable
+ENV PYTHONPATH=/app
+
+# Run the refactored entry point by default
+CMD ["python", "core/stream_chat.py"]
