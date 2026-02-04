@@ -5,3 +5,4 @@ mypy
 types-requests
 psycopg2-binary
 asyncpg
+questionary
