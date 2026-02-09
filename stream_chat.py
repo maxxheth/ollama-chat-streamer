@@ -234,7 +234,8 @@ def chat_with_tools(
     messages: List[Dict[str, str]],
     tools: List[Dict[str, Any]],
     file_handle: TextIO,
-    retry_config: RetryConfig
+    retry_config: RetryConfig,
+    render_delay: float = 0.0
 ) -> str:
     """
     Chat with the model, handling tool calls automatically.
@@ -301,8 +302,7 @@ def chat_with_tools(
         
         for chunk in stream:
             part = chunk['message']['content']
-            print(part, end="", flush=True)
-            log_to_file(file_handle, part)
+            render_stream_text(part, file_handle, delay=render_delay)
             full_response += part
         
         return full_response
@@ -314,8 +314,7 @@ def chat_with_tools(
         full_response = ""
         # Stream the content if available
         if message.content:
-            print(message.content, end="", flush=True)
-            log_to_file(file_handle, message.content)
+            render_stream_text(message.content, file_handle, delay=render_delay)
             full_response = message.content
         
         return full_response
@@ -420,6 +419,13 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--render-delay",
+        type=float,
+        default=_parse_env_float("RENDER_DELAY", 0.0),
+        help="Delay in seconds between rendered characters (default: 0.0 or env RENDER_DELAY)"
+    )
+
+    parser.add_argument(
         "--retry-max-attempts",
         type=int,
         default=_parse_env_int("RETRY_MAX_ATTEMPTS", 3),
@@ -458,6 +464,25 @@ def parse_arguments() -> argparse.Namespace:
 
 def log_to_file(file_handle: TextIO, text: str) -> None:
     """Writes text to file and forces a flush to ensure it's saved immediately."""
+    file_handle.write(text)
+    file_handle.flush()
+
+def render_stream_text(
+    text: str,
+    file_handle: TextIO,
+    flush_interval: int = 20,
+    delay: float = 0.0
+) -> None:
+    """Render text progressively to stdout while logging to file."""
+    if not text:
+        return
+    for idx, char in enumerate(text, start=1):
+        sys.stdout.write(char)
+        if flush_interval > 0 and idx % flush_interval == 0:
+            sys.stdout.flush()
+        if delay > 0:
+            time.sleep(delay)
+    sys.stdout.flush()
     file_handle.write(text)
     file_handle.flush()
 
@@ -816,7 +841,8 @@ def _run_chat_turn(
             messages=messages,
             tools=get_tools(),
             file_handle=file_handle,
-            retry_config=retry_config
+            retry_config=retry_config,
+            render_delay=args.render_delay
         )
 
     print(f"{model}: ", end="", flush=True)
@@ -831,8 +857,7 @@ def _run_chat_turn(
 
     for chunk in stream:
         part = chunk['message']['content']
-        print(part, end="", flush=True)
-        log_to_file(file_handle, part)
+        render_stream_text(part, file_handle, delay=args.render_delay)
         full_response += part
 
     return full_response
@@ -998,6 +1023,7 @@ def main() -> None:
     
     # Parse context argument
     context_config = parse_context_arg(args.context)
+    use_db_context = context_config.get("use_db", False)
     
     # Load context if provided
     context_content = ""
@@ -1045,28 +1071,34 @@ def main() -> None:
     if args.context:
         print(f"Context: {args.context}")
     print(f"Database Persistence: {'ON' if args.persist_to_db else 'OFF'}")
-    print(f"Conversation is being saved to: {os.path.abspath(args.dest)}\n")
+    if use_db_context:
+        print("Conversation logging: OFF (context includes 'db')\n")
+    else:
+        print(f"Conversation is being saved to: {os.path.abspath(args.dest)}\n")
     print("Type 'exit' or 'quit' to stop.\n")
 
-    # Open file in append mode
+    # Open file in append mode (or /dev/null when context includes db)
+    log_path = os.devnull if use_db_context else args.dest
+    log_mode = "w" if use_db_context else "a"
     try:
-        with open(args.dest, "a", encoding="utf-8") as f:
-            # Write session header
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            header = (
-                f"\n\n{'='*30}\n"
-                f"SESSION START: {timestamp}\n"
-                f"MODEL: {available_models[0]}\n"
-                f"FLAGS: exp={args.experimental}, web={args.experimental_websearch}\n"
-            )
-            if len(available_models) > 1:
-                header += f"FALLBACKS: {', '.join(available_models[1:])}\n"
-            if args.context:
-                header += f"CONTEXT: {args.context}\n"
-            if args.persist_to_db:
-                header += f"DB_PERSIST: true\n"
-            header += f"{'='*30}\n"
-            log_to_file(f, header)
+        with open(log_path, log_mode, encoding="utf-8") as f:
+            if not use_db_context:
+                # Write session header
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                header = (
+                    f"\n\n{'='*30}\n"
+                    f"SESSION START: {timestamp}\n"
+                    f"MODEL: {available_models[0]}\n"
+                    f"FLAGS: exp={args.experimental}, web={args.experimental_websearch}\n"
+                )
+                if len(available_models) > 1:
+                    header += f"FALLBACKS: {', '.join(available_models[1:])}\n"
+                if args.context:
+                    header += f"CONTEXT: {args.context}\n"
+                if args.persist_to_db:
+                    header += f"DB_PERSIST: true\n"
+                header += f"{'='*30}\n"
+                log_to_file(f, header)
 
             current_model_index = 0
             conversation_id = None  # Track database conversation ID
