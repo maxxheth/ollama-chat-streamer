@@ -274,20 +274,37 @@ def chat_with_tools(
         })
         
         # Execute each tool call and add results
-        for tool_call in message.tool_calls:
+        for index, tool_call in enumerate(message.tool_calls):
+            tool_function = getattr(tool_call, "function", None)
+            if isinstance(tool_call, dict):
+                tool_function = tool_call.get("function")
+
+            tool_name = getattr(tool_function, "name", None)
+            tool_args = getattr(tool_function, "arguments", None)
+            if isinstance(tool_function, dict):
+                tool_name = tool_function.get("name")
+                tool_args = tool_function.get("arguments")
+
+            tool_call_id = getattr(tool_call, "id", None)
+            if not tool_call_id and isinstance(tool_call, dict):
+                tool_call_id = tool_call.get("id")
+            if not tool_call_id:
+                tool_call_id = f"tool_call_{index}"
+
             result = execute_tool_call({
                 "function": {
-                    "name": tool_call.function.name,
-                    "arguments": tool_call.function.arguments
+                    "name": tool_name,
+                    "arguments": tool_args
                 }
             })
             
             messages.append({
                 "role": "tool",
                 "content": result,
-                "tool_call_id": tool_call.id
+                "tool_call_id": tool_call_id
             })
-            log_to_file(file_handle, f"\n[Tool '{tool_call.function.name}' used]\n")
+            if tool_name:
+                log_to_file(file_handle, f"\n[Tool '{tool_name}' used]\n")
         
         # Second call - get the final response with tool results
         print(f"{model}: ", end="", flush=True)
