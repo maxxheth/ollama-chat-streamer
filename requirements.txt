@@ -6,3 +6,4 @@ types-requests
 psycopg2-binary
 asyncpg
 questionary
+pytest

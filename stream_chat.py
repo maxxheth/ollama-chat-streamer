@@ -7,10 +7,14 @@ import csv
 import glob
 import time
 import random
+import threading
+import queue
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
-from typing import List, Dict, TextIO, Any, Optional, Callable, Iterable
+from typing import List, Dict, TextIO, Any, Optional, Callable, Iterable, Tuple
 from dotenv import load_dotenv
 import textwrap
 
@@ -36,10 +40,21 @@ except ImportError:
 
 # Attempt to import DuckDuckGo for web search
 try:
-    from ddgs import DDGS  # type: ignore
+    from ddgs import DDGS
     HAS_DDG = True
 except ImportError:
-    HAS_DDG = False
+    try:
+        from duckduckgo_search import DDGS
+        HAS_DDG = True
+    except ImportError:
+        HAS_DDG = False
+
+# Optional YAML config support
+try:
+    import yaml  # type: ignore
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
 
 
 @dataclass(frozen=True)
@@ -123,7 +138,17 @@ def _stream_chat_with_retry(
     delay = max(0.0, config.initial_delay)
     for attempt in range(1, attempts + 1):
         try:
-            stream = ollama.chat(model=model, messages=messages, stream=True, **kwargs)
+            stream = _stream_ollama_chat_with_timeouts(
+                model=model,
+                messages=messages,
+                start_timeout=kwargs.pop("start_timeout", None),
+                idle_timeout=kwargs.pop("idle_timeout", None),
+                spinner_enabled=kwargs.pop("spinner_enabled", True),
+                spinner_style=kwargs.pop("spinner_style", "line"),
+                spinner_interval=kwargs.pop("spinner_interval", 0.1),
+                spinner_stall_delay=kwargs.pop("spinner_stall_delay", 1.5),
+                **kwargs
+            )
             for chunk in stream:
                 yield chunk
             return
@@ -134,6 +159,251 @@ def _stream_chat_with_retry(
             print(f"\n[Retry {attempt}/{attempts} after error: {exc}] Waiting {sleep_time:.2f}s...")
             time.sleep(sleep_time)
             delay = min(config.max_delay, delay * max(1.0, config.multiplier))
+
+
+def _run_with_timeout(action: Callable[[], Any], timeout_s: Optional[float], timeout_message: str) -> Any:
+    if timeout_s is None or timeout_s <= 0:
+        return action()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(action)
+        try:
+            return future.result(timeout=timeout_s)
+        except FuturesTimeoutError:
+            raise TimeoutError(timeout_message)
+
+
+class Spinner:
+    def __init__(
+        self,
+        message: str,
+        enabled: bool = True,
+        style: str = "line",
+        interval: float = 0.1,
+        stream: Optional[TextIO] = None
+    ) -> None:
+        self.message = message
+        self.enabled = enabled
+        self.style = style
+        self.interval = interval
+        self.stream = stream or sys.stderr
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _frames(self) -> List[str]:
+        if self.style == "dots":
+            return [".", "..", "..."]
+        return ["|", "/", "-", "\\"]
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+
+        def run() -> None:
+            frames = self._frames()
+            idx = 0
+            while not self._stop_event.is_set():
+                frame = frames[idx % len(frames)]
+                self.stream.write(f"\r{self.message} {frame}")
+                self.stream.flush()
+                idx += 1
+                time.sleep(self.interval)
+            self.stream.write("\r\033[K")
+            self.stream.flush()
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if not self.enabled:
+            return
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=0.2)
+
+
+def _stream_ollama_chat_with_timeouts(
+    model: str,
+    messages: List[Dict[str, str]],
+    start_timeout: Optional[float],
+    idle_timeout: Optional[float],
+    spinner_enabled: bool,
+    spinner_style: str,
+    spinner_interval: float,
+    spinner_stall_delay: float,
+    **kwargs: Any
+) -> Iterable[Dict[str, Any]]:
+    q: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+    stop_event = threading.Event()
+
+    def worker() -> None:
+        try:
+            for chunk in ollama.chat(model=model, messages=messages, stream=True, **kwargs):
+                if stop_event.is_set():
+                    break
+                q.put(("chunk", chunk))
+            q.put(("done", None))
+        except Exception as exc:
+            q.put(("error", exc))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    first_token = True
+    start_time = time.monotonic()
+    spinner = Spinner(
+        message="Waiting for response",
+        enabled=spinner_enabled,
+        style=spinner_style,
+        interval=spinner_interval
+    )
+
+    def start_spinner_after(delay: float) -> Optional[threading.Timer]:
+        if not spinner_enabled:
+            return None
+        if delay <= 0:
+            spinner.start()
+            return None
+        timer = threading.Timer(delay, spinner.start)
+        timer.daemon = True
+        timer.start()
+        return timer
+
+    while True:
+        timeout: Optional[float] = None
+        if first_token and start_timeout and start_timeout > 0:
+            elapsed = time.monotonic() - start_time
+            timeout = max(0.0, start_timeout - elapsed)
+        elif idle_timeout and idle_timeout > 0:
+            timeout = idle_timeout
+
+        spinner_timer = None
+        if first_token:
+            spinner_timer = start_spinner_after(0.0)
+        else:
+            spinner_timer = start_spinner_after(spinner_stall_delay)
+
+        try:
+            kind, payload = q.get(timeout=timeout)
+        except queue.Empty:
+            stop_event.set()
+            if spinner_timer:
+                spinner_timer.cancel()
+            spinner.stop()
+            if first_token and start_timeout and start_timeout > 0:
+                raise TimeoutError("Ollama response start timed out")
+            raise TimeoutError("Ollama response stalled")
+
+        if kind == "chunk":
+            if spinner_timer:
+                spinner_timer.cancel()
+            spinner.stop()
+            if first_token:
+                first_token = False
+            yield payload
+        elif kind == "done":
+            if spinner_timer:
+                spinner_timer.cancel()
+            spinner.stop()
+            return
+        elif kind == "error":
+            if spinner_timer:
+                spinner_timer.cancel()
+            spinner.stop()
+            raise payload
+
+
+def _load_yaml_config(path: str) -> Dict[str, Any]:
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        print(f"[Config Warning] YAML config file not found: {path}")
+        return {}
+    if not HAS_YAML:
+        print("[Config Warning] PyYAML not installed. Install with: pip install pyyaml")
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+            if isinstance(data, dict):
+                return data
+    except Exception as exc:
+        print(f"[Config Warning] Failed to load YAML config: {exc}")
+    return {}
+
+
+def _yaml_get(data: Dict[str, Any], *keys: str) -> Any:
+    cur: Any = data
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
+
+
+def _resolve_float(
+    cli_value: Optional[float],
+    env_name: str,
+    yaml_data: Dict[str, Any],
+    yaml_keys: Tuple[str, ...],
+    default: float
+) -> float:
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get(env_name)
+    if env_value:
+        try:
+            return float(env_value)
+        except ValueError:
+            return default
+    yaml_value = _yaml_get(yaml_data, *yaml_keys)
+    if yaml_value is not None:
+        try:
+            return float(yaml_value)
+        except (ValueError, TypeError):
+            return default
+    return default
+
+
+def _resolve_bool(
+    cli_true: bool,
+    cli_false: bool,
+    env_name: str,
+    yaml_data: Dict[str, Any],
+    yaml_keys: Tuple[str, ...],
+    default: bool
+) -> bool:
+    if cli_true:
+        return True
+    if cli_false:
+        return False
+    env_value = os.environ.get(env_name)
+    if env_value:
+        return env_value.lower() in {"1", "true", "yes", "on"}
+    yaml_value = _yaml_get(yaml_data, *yaml_keys)
+    if yaml_value is not None:
+        return bool(yaml_value)
+    return default
+
+
+def _resolve_str(
+    cli_value: Optional[str],
+    env_name: str,
+    yaml_data: Dict[str, Any],
+    yaml_keys: Tuple[str, ...],
+    default: str
+) -> str:
+    if cli_value:
+        return cli_value
+    env_value = os.environ.get(env_name)
+    if env_value:
+        return env_value
+    yaml_value = _yaml_get(yaml_data, *yaml_keys)
+    if yaml_value is not None:
+        return str(yaml_value)
+    return default
 
 
 def _ensure_model_available(model: str, config: RetryConfig) -> None:
@@ -162,7 +432,7 @@ def get_tools() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Search the web for current information, news, facts, or data that may not be in the model's training data. Use this when the user asks about current events, recent news, specific facts you're unsure about, or time-sensitive information.",
+                "description": "Search the web for current information, news, facts, or data that may not be in the model's training data. Use this when the user asks about current events, recent news, specific facts you're unsure about, or time‑sensitive information.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -178,54 +448,254 @@ def get_tools() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "read_json_file",
-                "description": "Read and parse a JSON file efficiently without loading everything into memory at once. Supports newline-delimited JSON (NDJSON) and regular JSON with safeguards for large files.",
+                "name": "read_file",
+                "description": "Read the contents of a text file. Supports any text-based file format (txt, md, py, json, yaml, etc.). Use this when the user asks you to read or examine a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "Path to the JSON file to read"
+                            "description": "Path to the file to read"
                         },
-                        "max_entries": {
+                        "max_lines": {
                             "type": "integer",
-                            "description": "Maximum number of entries to read (default: 100, use -1 for all)",
-                            "default": 100
+                            "description": "Maximum number of lines to read (default: 1000, use -1 for all)",
+                            "default": 1000
                         },
-                        "query_filter": {
-                            "type": "string",
-                            "description": "Optional dot/array path filter (e.g., 'conversations[*].messages[*].content')"
-                        },
-                        "return_summary": {
-                            "type": "boolean",
-                            "description": "If true, return a summary instead of full data",
-                            "default": False
+                        "start_line": {
+                            "type": "integer",
+                            "description": "Starting line number (1-indexed, default: 1)",
+                            "default": 1
                         }
                     },
                     "required": ["file_path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_json_file",
+                "description": "Read and parse a JSON file efficiently without loading everything into memory at once. Supports newline‑delimited JSON (NDJSON) and regular JSON with safeguards for large files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "Path to the JSON file to read"},
+                        "max_entries": {"type": "integer", "description": "Maximum number of entries to read (default: 100, use -1 for all)", "default": 100},
+                        "query_filter": {"type": "string", "description": "Optional dot/array path filter (e.g., 'conversations[*].messages[*].content')"},
+                        "return_summary": {"type": "boolean", "description": "If true, return a summary instead of full data", "default": False}
+                    },
+                    "required": ["file_path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write content to a file. Creates the file if it doesn't exist, or overwrites it if it does. Use this when the user asks you to create or save a file with specific content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "File path to write to"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The content to write to the file"
+                        },
+                        "create_dirs": {
+                            "type": "boolean",
+                            "description": "If true, create parent directories if they don't exist (default: true)",
+                            "default": True
+                        }
+                    },
+                    "required": ["file_path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "append_file",
+                "description": "Append content to an existing file. Creates the file if it doesn't exist. Use this when the user asks you to add to a file without overwriting it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "File path to append to"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The content to append to the file"
+                        },
+                        "add_newline": {
+                            "type": "boolean",
+                            "description": "If true, add a newline before appending (default: true)",
+                            "default": True
+                        }
+                    },
+                    "required": ["file_path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": "List files and directories in a given path. Use this when the user asks what files are in a directory or needs to explore the file system.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "directory_path": {
+                            "type": "string",
+                            "description": "Path to the directory to list"
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Optional glob pattern to filter results (e.g., '*.py', '*.md')",
+                            "default": "*"
+                        },
+                        "recursive": {
+                            "type": "boolean",
+                            "description": "If true, list files recursively (default: false)",
+                            "default": False
+                        }
+                    },
+                    "required": ["directory_path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_shell",
+                "description": "Run a shell command and return its output. Use this to execute commands, install packages, run scripts, check system state, or inspect processes. Always show the user what command you're about to run before executing it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to execute"
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Timeout in seconds (default: 30)",
+                            "default": 30
+                        },
+                        "workdir": {
+                            "type": "string",
+                            "description": "Working directory for the command (default: current directory)"
+                        }
+                    },
+                    "required": ["command"]
                 }
             }
         }
     ]
 
 
-def execute_tool_call(tool_call: Dict[str, Any]) -> str:
+def execute_tool_call(
+    tool_call: Dict[str, Any],
+    tool_timeout: Optional[float] = None,
+    web_search_timeout: Optional[float] = None,
+    output_dir: Optional[str] = None
+) -> str:
     """Execute a tool call and return the result."""
     function_name = tool_call.get("function", {}).get("name")
-    arguments = json.loads(tool_call.get("function", {}).get("arguments", "{}"))
+    raw_arguments = tool_call.get("function", {}).get("arguments", "{}")
+    if isinstance(raw_arguments, dict):
+        arguments = raw_arguments
+    else:
+        arguments = json.loads(raw_arguments)
     
     if function_name == "web_search":
         query = arguments.get("query", "")
-        return perform_web_search(query)
+        timeout_s = web_search_timeout if web_search_timeout is not None else tool_timeout
+        try:
+            return _run_with_timeout(
+                lambda: perform_web_search(query),
+                timeout_s,
+                "web_search timed out"
+            )
+        except TimeoutError:
+            return "[Web Search Timeout: exceeded configured limit]"
+
+    if function_name == "read_file":
+        try:
+            return _run_with_timeout(
+                lambda: read_file(
+                    file_path=arguments.get("file_path", ""),
+                    max_lines=int(arguments.get("max_lines", 1000)),
+                    start_line=int(arguments.get("start_line", 1)),
+                ),
+                tool_timeout,
+                "read_file timed out"
+            )
+        except TimeoutError:
+            return "[Tool Timeout: read_file exceeded configured limit]"
 
     if function_name == "read_json_file":
-        return read_json_file(
+        try:
+            return _run_with_timeout(
+                lambda: read_json_file(
+                    file_path=arguments.get("file_path", ""),
+                    max_entries=int(arguments.get("max_entries", 100)),
+                    query_filter=arguments.get("query_filter", ""),
+                    return_summary=bool(arguments.get("return_summary", False))
+                ),
+                tool_timeout,
+                "read_json_file timed out"
+            )
+        except TimeoutError:
+            return "[Tool Timeout: read_json_file exceeded configured limit]"
+
+    if function_name == "write_file":
+        return write_file(
             file_path=arguments.get("file_path", ""),
-            max_entries=int(arguments.get("max_entries", 100)),
-            query_filter=arguments.get("query_filter", ""),
-            return_summary=bool(arguments.get("return_summary", False))
+            content=arguments.get("content", ""),
+            create_dirs=bool(arguments.get("create_dirs", True)),
+        )
+
+    if function_name == "append_file":
+        return append_file(
+            file_path=arguments.get("file_path", ""),
+            content=arguments.get("content", ""),
+            add_newline=bool(arguments.get("add_newline", True)),
+        )
+
+    if function_name == "list_directory":
+        return list_directory(
+            directory_path=arguments.get("directory_path", ""),
+            pattern=arguments.get("pattern", "*"),
+            recursive=bool(arguments.get("recursive", False)),
+        )
+
+    if function_name == "run_shell":
+        try:
+            return _run_with_timeout(
+                lambda: run_shell(
+                    command=arguments.get("command", ""),
+                    timeout=int(arguments.get("timeout", 30)),
+                    workdir=arguments.get("workdir"),
+                ),
+                tool_timeout,
+                "run_shell timed out"
+            )
+        except TimeoutError:
+            return "[Tool Timeout: run_shell exceeded configured limit]"
+    if function_name == "write_output_file":
+        file_path = arguments.get("file_path", "")
+        content = arguments.get("content", "")
+        return write_output_file(
+            file_path=file_path,
+            content=content,
+            output_dir=output_dir
         )
     
+    return f"[Error: Unknown tool '{function_name}']"
     return f"[Error: Unknown tool '{function_name}']"
 
 
@@ -235,76 +705,152 @@ def chat_with_tools(
     tools: List[Dict[str, Any]],
     file_handle: TextIO,
     retry_config: RetryConfig,
-    render_delay: float = 0.0
+    render_delay: float = 0.0,
+    tool_timeout: Optional[float] = None,
+    web_search_timeout: Optional[float] = None,
+    ollama_timeout: Optional[float] = None,
+    ollama_first_token_timeout: Optional[float] = None,
+    ollama_stream_idle_timeout: Optional[float] = None,
+    tool_output_dir: Optional[str] = None,
+    spinner_enabled: bool = True,
+    spinner_style: str = "line",
+    spinner_interval: float = 0.1,
+    spinner_stall_delay: float = 1.5
 ) -> str:
     """
     Chat with the model, handling tool calls automatically.
     Returns the final assistant response.
     """
+    # Inject a system prompt so small models know to use their tools
+    tool_names = [t["function"]["name"] for t in tools if t.get("type") == "function"]
+    if tool_names:
+        tool_instruction = (
+            "You are a helpful assistant with access to tools. "
+            "You MUST use your tools when they can help answer the question — "
+            "do NOT say you cannot help when a tool would provide the answer. "
+            f"Available tools: {', '.join(tool_names)}. "
+            "For real-time or current information, use web_search or run_shell. "
+            "For file operations, use read_file, write_file, or list_directory. "
+            "For shell commands, use run_shell."
+        )
+        has_system = any(msg.get("role") == "system" for msg in messages)
+        if has_system:
+            for msg in messages:
+                if msg.get("role") == "system":
+                    msg["content"] = f"{tool_instruction}\n\n{msg.get('content', '')}"
+                    break
+        else:
+            messages.insert(0, {"role": "system", "content": tool_instruction})
+
     # First call - let the model decide if it needs tools
-    response = _retry_call(
-        lambda: ollama.chat(
-            model=model,
-            messages=messages,
-            tools=tools
-        ),
-        retry_config
+    selection_spinner = Spinner(
+        message="Waiting for model",
+        enabled=spinner_enabled,
+        style=spinner_style,
+        interval=spinner_interval
     )
+    selection_spinner.start()
+    try:
+        def chat_call():
+            kwargs = {}
+            # LFM2.5 works best with think=False for tool calling
+            if _supports_lfm2_tool_format(model):
+                kwargs['think'] = False
+            return ollama.chat(model=model, messages=messages, tools=tools, **kwargs)
+        
+        response = _retry_call(
+            lambda: _run_with_timeout(chat_call, ollama_timeout, "Ollama tool selection call timed out"),
+            retry_config
+        )
+    finally:
+        selection_spinner.stop()
     
     message = response.message
     
     # Check if the model wants to use tools
     if hasattr(message, 'tool_calls') and message.tool_calls:
-        print(f"\n[Tool calls detected: {[tc.function.name for tc in message.tool_calls]}]")
-        
+        tool_calls_info = []
+        for tc in message.tool_calls:
+            tc_function = getattr(tc, "function", None)
+            if isinstance(tc, dict):
+                tc_function = tc.get("function")
+
+            tc_name = getattr(tc_function, "name", None)
+            tc_args = getattr(tc_function, "arguments", None)
+            if isinstance(tc_function, dict):
+                tc_name = tc_function.get("name")
+                tc_args = tc_function.get("arguments")
+
+            tc_id = getattr(tc, "id", None)
+            if tc_id is None and isinstance(tc, dict):
+                tc_id = tc.get("id")
+
+            tool_calls_info.append({
+                "id": tc_id,
+                "name": tc_name,
+                "arguments": tc_args,
+            })
+
+        tool_names = [info["name"] for info in tool_calls_info if info.get("name")]
+        print(f"\n[Tool calls detected: {tool_names}]")
+
         # Add the assistant's tool call request to history
+        tool_calls_payload = []
+        for info in tool_calls_info:
+            payload = {
+                "type": "function",
+                "function": {
+                    "name": info["name"],
+                    "arguments": info["arguments"],
+                },
+            }
+            if info.get("id") is not None:
+                payload["id"] = info["id"]
+            tool_calls_payload.append(payload)
+
         messages.append({
             "role": "assistant",
             "content": message.content or "",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
-                    }
-                } for tc in message.tool_calls
-            ]
+            "tool_calls": tool_calls_payload,
         })
-        
+
         # Execute each tool call and add results
-        for index, tool_call in enumerate(message.tool_calls):
-            tool_function = getattr(tool_call, "function", None)
-            if isinstance(tool_call, dict):
-                tool_function = tool_call.get("function")
+        for info in tool_calls_info:
+            tool_name = info.get("name") or "tool"
+            spinner = Spinner(
+                message=f"Running tool '{tool_name}'",
+                enabled=spinner_enabled,
+                style=spinner_style,
+                interval=spinner_interval
+            )
+            spinner.start()
+            try:
+                tool_kwargs: Dict[str, Optional[float]] = {}
+                if tool_timeout is not None:
+                    tool_kwargs["tool_timeout"] = tool_timeout
+                if web_search_timeout is not None:
+                    tool_kwargs["web_search_timeout"] = web_search_timeout
+                if tool_output_dir:
+                    tool_kwargs["output_dir"] = tool_output_dir
+                result = execute_tool_call({
+                    "function": {
+                        "name": info["name"],
+                        "arguments": info["arguments"],
+                    }
+                }, **tool_kwargs)
+            finally:
+                spinner.stop()
 
-            tool_name = getattr(tool_function, "name", None)
-            tool_args = getattr(tool_function, "arguments", None)
-            if isinstance(tool_function, dict):
-                tool_name = tool_function.get("name")
-                tool_args = tool_function.get("arguments")
-
-            tool_call_id = getattr(tool_call, "id", None)
-            if not tool_call_id and isinstance(tool_call, dict):
-                tool_call_id = tool_call.get("id")
-            if not tool_call_id:
-                tool_call_id = f"tool_call_{index}"
-
-            result = execute_tool_call({
-                "function": {
-                    "name": tool_name,
-                    "arguments": tool_args
-                }
-            })
-            
-            messages.append({
+            tool_message = {
                 "role": "tool",
                 "content": result,
-                "tool_call_id": tool_call_id
-            })
-            if tool_name:
-                log_to_file(file_handle, f"\n[Tool '{tool_name}' used]\n")
+            }
+            if info.get("id") is not None:
+                tool_message["tool_call_id"] = info["id"]
+            messages.append(tool_message)
+
+            if info.get("name"):
+                log_to_file(file_handle, f"\n[Tool '{info['name']}' used]\n")
         
         # Second call - get the final response with tool results
         print(f"{model}: ", end="", flush=True)
@@ -314,7 +860,13 @@ def chat_with_tools(
         stream = _stream_chat_with_retry(
             model=model,
             messages=messages,
-            config=retry_config
+            config=retry_config,
+            start_timeout=ollama_first_token_timeout,
+            idle_timeout=ollama_stream_idle_timeout,
+            spinner_enabled=spinner_enabled,
+            spinner_style=spinner_style,
+            spinner_interval=spinner_interval,
+            spinner_stall_delay=spinner_stall_delay
         )
         
         for chunk in stream:
@@ -342,6 +894,13 @@ def parse_arguments() -> argparse.Namespace:
     Precedence: CLI Flag > Environment Variable > Default Value
     """
     parser = argparse.ArgumentParser(description="Stream chat with Ollama models.")
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to YAML config file (env CHAT_CONFIG)."
+    )
 
     parser.add_argument(
         "--model",
@@ -436,10 +995,86 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--tool-output-dir",
+        type=str,
+        default=os.environ.get("TOOL_OUTPUT_DIR", "sessions"),
+        help="Base directory for tool-generated output files (default: ./sessions or env TOOL_OUTPUT_DIR)"
+    )
+
+    parser.add_argument(
         "--render-delay",
         type=float,
         default=_parse_env_float("RENDER_DELAY", 0.0),
         help="Delay in seconds between rendered characters (default: 0.0 or env RENDER_DELAY)"
+    )
+
+    parser.add_argument(
+        "--tool-timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds for any tool call (env TOOL_TIMEOUT, yaml timeouts.tool)"
+    )
+
+    parser.add_argument(
+        "--web-search-timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds for web_search tool (env WEB_SEARCH_TIMEOUT, yaml timeouts.web_search)"
+    )
+
+    parser.add_argument(
+        "--ollama-timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds for non-stream Ollama calls (env OLLAMA_TIMEOUT, yaml timeouts.ollama)"
+    )
+
+    parser.add_argument(
+        "--ollama-first-token-timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds waiting for first token (env OLLAMA_FIRST_TOKEN_TIMEOUT, yaml timeouts.ollama_first_token)"
+    )
+
+    parser.add_argument(
+        "--ollama-stream-idle-timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds for stalled streams (env OLLAMA_STREAM_IDLE_TIMEOUT, yaml timeouts.ollama_stream_idle)"
+    )
+
+    spinner_group = parser.add_mutually_exclusive_group()
+    spinner_group.add_argument(
+        "--spinner",
+        action="store_true",
+        help="Enable terminal spinner indicators (env SPINNER_ENABLED, yaml ui.spinner)"
+    )
+    spinner_group.add_argument(
+        "--no-spinner",
+        action="store_true",
+        help="Disable terminal spinner indicators"
+    )
+
+    parser.add_argument(
+        "--spinner-style",
+        type=str,
+        default=None,
+        choices=["line", "dots"],
+        help="Spinner style: line or dots (env SPINNER_STYLE, yaml ui.spinner_style)"
+    )
+
+    parser.add_argument(
+        "--spinner-interval",
+        type=float,
+        default=None,
+        help="Spinner frame interval seconds (env SPINNER_INTERVAL, yaml ui.spinner_interval)"
+    )
+
+    parser.add_argument(
+        "--spinner-stall-delay",
+        type=float,
+        default=None,
+        help="Seconds of no tokens before showing spinner (env SPINNER_STALL_DELAY, yaml ui.spinner_stall_delay)"
     )
 
     parser.add_argument(
@@ -528,6 +1163,152 @@ def perform_web_search(query: str) -> str:
         return f"[Web Search Error: {str(e)}]"
 
 
+def read_file(file_path: str, max_lines: int = 1000, start_line: int = 1) -> str:
+    """Read a text file with optional line limits."""
+    path = Path(file_path)
+    if not file_path:
+        return "[Error: file_path is required]"
+    if not path.exists():
+        return f"[Error: File not found: {file_path}]"
+    if not path.is_file():
+        return f"[Error: Path is not a file: {file_path}]"
+    
+    print(f"\n[Reading file: {file_path}]")
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+        
+        start_idx = max(0, start_line - 1)
+        if max_lines > 0:
+            end_idx = start_idx + max_lines
+            selected_lines = lines[start_idx:end_idx]
+        else:
+            selected_lines = lines[start_idx:]
+        
+        content = ''.join(selected_lines)
+        total_lines = len(lines)
+        shown_lines = len(selected_lines)
+        
+        return f"[File: {file_path} (showing {shown_lines} of {total_lines} lines)]\n\n{content}"
+    except Exception as e:
+        return f"[Error reading file: {str(e)}]"
+
+
+def write_file(file_path: str, content: str, create_dirs: bool = True) -> str:
+    """Write content to a file, creating directories if needed."""
+    if not file_path:
+        return "[Error: file_path is required]"
+    
+    path = Path(file_path)
+    try:
+        if create_dirs:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        return f"[File written: {path}] ({len(content)} bytes)"
+    except Exception as e:
+        return f"[Error writing file: {str(e)}]"
+
+
+def append_file(file_path: str, content: str, add_newline: bool = True) -> str:
+    """Append content to a file."""
+    if not file_path:
+        return "[Error: file_path is required]"
+    
+    path = Path(file_path)
+    try:
+        if path.exists():
+            with open(path, 'rb') as f:
+                f.seek(0, 2)
+                if f.tell() > 0:
+                    f.seek(-1, 2)
+                    last_char = f.read(1)
+                    needs_newline = add_newline and last_char != b'\n'
+                else:
+                    needs_newline = False
+        else:
+            needs_newline = False
+        
+        with open(path, 'a', encoding='utf-8') as f:
+            if needs_newline:
+                f.write('\n')
+            f.write(content)
+        
+        return f"[Content appended to: {path}] ({len(content)} bytes)"
+    except Exception as e:
+        return f"[Error appending to file: {str(e)}]"
+
+
+def list_directory(directory_path: str, pattern: str = "*", recursive: bool = False) -> str:
+    """List files and directories in a path."""
+    if not directory_path:
+        return "[Error: directory_path is required]"
+    
+    path = Path(directory_path)
+    if not path.exists():
+        return f"[Error: Directory not found: {directory_path}]"
+    if not path.is_dir():
+        return f"[Error: Path is not a directory: {directory_path}]"
+    
+    print(f"\n[Listing directory: {directory_path}]")
+    try:
+        if recursive:
+            items = list(path.rglob(pattern))
+        else:
+            items = list(path.glob(pattern))
+        
+        items.sort(key=lambda x: (not x.is_dir(), x.name))
+        
+        if not items:
+            return f"[Directory is empty: {directory_path}]"
+        
+        lines = [f"[Directory: {directory_path}]"]
+        for item in items:
+            if item.is_dir():
+                lines.append(f"📁 {item.name}/")
+            else:
+                size = item.stat().st_size
+                size_str = f"{size:,} B" if size < 1024 else f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/1024/1024:.1f} MB"
+                lines.append(f"📄 {item.name} ({size_str})")
+        
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[Error listing directory: {str(e)}]"
+
+
+def run_shell(command: str, timeout: int = 30, workdir: Optional[str] = None) -> str:
+    """Run a shell command and return its stdout, stderr, and exit code."""
+    if not command:
+        return "[Error: command is required]"
+    
+    print(f"\n[Running: {command}]")
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=workdir,
+        )
+        parts = []
+        if result.stdout:
+            parts.append(result.stdout.rstrip())
+        if result.stderr:
+            parts.append(f"[stderr]\n{result.stderr.rstrip()}")
+        parts.append(f"[exit code: {result.returncode}]")
+        output = "\n".join(parts)
+        if not result.stdout and not result.stderr:
+            return f"[Command completed with exit code {result.returncode}]"
+        return output
+    except subprocess.TimeoutExpired:
+        return f"[Error: Command timed out after {timeout}s]"
+    except Exception as e:
+        return f"[Error running command: {str(e)}]"
+
+
 def read_json_file(
     file_path: str,
     max_entries: int = 100,
@@ -557,6 +1338,44 @@ def read_json_file(
         return f"[Error: Invalid JSON - {str(e)}]"
     except Exception as e:
         return f"[Error reading file: {str(e)}]"
+
+
+def _resolve_output_path(file_path: str, output_dir: Optional[str]) -> Tuple[Optional[Path], Optional[str]]:
+    if not file_path:
+        return None, "[Error: file_path is required]"
+
+    base_dir = Path(output_dir or "sessions").expanduser()
+    if not base_dir.is_absolute():
+        base_dir = (Path.cwd() / base_dir).resolve()
+    else:
+        base_dir = base_dir.resolve()
+
+    target_path = Path(file_path).expanduser()
+    if not target_path.is_absolute():
+        target_path = (base_dir / target_path).resolve()
+    else:
+        target_path = target_path.resolve()
+
+    if base_dir != target_path and base_dir not in target_path.parents:
+        return None, "[Error: file_path is outside the allowed output directory]"
+
+    return target_path, None
+
+
+def write_output_file(file_path: str, content: str, output_dir: Optional[str] = None) -> str:
+    target_path, error = _resolve_output_path(file_path, output_dir)
+    if error:
+        return error
+    if target_path is None:
+        return "[Error: Invalid output path]"
+
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(target_path, "a", encoding="utf-8") as handle:
+            handle.write(content)
+        return f"[File written: {target_path}]"
+    except Exception as exc:
+        return f"[Error writing file: {exc}]"
 
 
 def _detect_ndjson(path: Path) -> bool:
@@ -765,7 +1584,8 @@ def load_context_files(context_path: str, extensions: List[str]) -> str:
 def load_context_from_database(
     db_manager, 
     additional_paths: Optional[List[str]] = None,
-    limit: Optional[int] = None
+    limit: Optional[int] = None,
+    extensions: Optional[List[str]] = None
 ) -> str:
     """
     Load context from database and optionally from additional file paths.
@@ -798,9 +1618,10 @@ def load_context_from_database(
     
     # Load from additional paths
     if additional_paths:
+        load_extensions = extensions or ['txt', 'log']
         for path in additional_paths:
             if path and path != 'db':
-                content = load_context_files(path, ['txt', 'log'])
+                content = load_context_files(path, load_extensions)
                 if content:
                     context_parts.append(f"=== File Context: {path} ===\n{content}\n")
     
@@ -845,6 +1666,140 @@ def _get_retry_config_from_args(args: argparse.Namespace) -> RetryConfig:
     )
 
 
+def _apply_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
+    config_path = args.config or os.environ.get("CHAT_CONFIG", "")
+    yaml_data = _load_yaml_config(config_path)
+
+    args.tool_timeout = _resolve_float(
+        args.tool_timeout,
+        "TOOL_TIMEOUT",
+        yaml_data,
+        ("timeouts", "tool"),
+        30.0
+    )
+
+    args.web_search_timeout = _resolve_float(
+        args.web_search_timeout,
+        "WEB_SEARCH_TIMEOUT",
+        yaml_data,
+        ("timeouts", "web_search"),
+        args.tool_timeout
+    )
+
+    args.ollama_timeout = _resolve_float(
+        args.ollama_timeout,
+        "OLLAMA_TIMEOUT",
+        yaml_data,
+        ("timeouts", "ollama"),
+        60.0
+    )
+
+    args.ollama_first_token_timeout = _resolve_float(
+        args.ollama_first_token_timeout,
+        "OLLAMA_FIRST_TOKEN_TIMEOUT",
+        yaml_data,
+        ("timeouts", "ollama_first_token"),
+        20.0
+    )
+
+    args.ollama_stream_idle_timeout = _resolve_float(
+        args.ollama_stream_idle_timeout,
+        "OLLAMA_STREAM_IDLE_TIMEOUT",
+        yaml_data,
+        ("timeouts", "ollama_stream_idle"),
+        15.0
+    )
+
+    args.spinner_enabled = _resolve_bool(
+        args.spinner,
+        args.no_spinner,
+        "SPINNER_ENABLED",
+        yaml_data,
+        ("ui", "spinner"),
+        True
+    )
+
+    args.spinner_style = _resolve_str(
+        args.spinner_style,
+        "SPINNER_STYLE",
+        yaml_data,
+        ("ui", "spinner_style"),
+        "line"
+    )
+
+    args.spinner_interval = _resolve_float(
+        args.spinner_interval,
+        "SPINNER_INTERVAL",
+        yaml_data,
+        ("ui", "spinner_interval"),
+        0.1
+    )
+
+    args.spinner_stall_delay = _resolve_float(
+        args.spinner_stall_delay,
+        "SPINNER_STALL_DELAY",
+        yaml_data,
+        ("ui", "spinner_stall_delay"),
+        1.5
+    )
+
+    return yaml_data
+
+
+def _get_model_specific_timeout(model: str, base_timeout: Optional[float]) -> Optional[float]:
+    """Get adjusted timeout for models that need more time for tool selection."""
+    if base_timeout is not None:
+        return base_timeout
+    if model.lower().startswith("lfm2"):
+        return 120.0
+    return None
+
+
+def _supports_lfm2_tool_format(model: str) -> bool:
+    """Check if model is LFM2.x which prefers tools in system prompt."""
+    return model.lower().startswith("lfm2")
+
+
+def _format_tools_for_lfm2(tools: List[Dict[str, Any]]) -> str:
+    """Format tools as JSON string for LFM2.5 system prompt."""
+    simplified_tools = []
+    for tool in tools:
+        if tool.get("type") == "function":
+            func = tool.get("function", {})
+            simplified_tools.append({
+                "name": func.get("name", ""),
+                "description": func.get("description", ""),
+                "parameters": func.get("parameters", {})
+            })
+    return json.dumps(simplified_tools, indent=2)
+
+
+def _prepare_messages_for_lfm2(
+    messages: List[Dict[str, str]],
+    tools: List[Dict[str, Any]]
+) -> List[Dict[str, str]]:
+    """Prepare messages with tools in system prompt for LFM2.5."""
+    tools_json = _format_tools_for_lfm2(tools)
+    system_content = f"List of tools: {tools_json}"
+    
+    # Check if there's already a system message
+    has_system = any(msg.get("role") == "system" for msg in messages)
+    
+    if has_system:
+        # Append tools to existing system message
+        new_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                existing_content = msg.get("content", "")
+                msg = msg.copy()
+                msg["content"] = f"{existing_content}\n\n{system_content}"
+            new_messages.append(msg)
+        return new_messages
+    else:
+        # Prepend new system message
+        return [{"role": "system", "content": system_content}] + messages
+
+
 def _run_chat_turn(
     model: str,
     messages: List[Dict[str, str]],
@@ -853,13 +1808,26 @@ def _run_chat_turn(
     retry_config: RetryConfig
 ) -> str:
     if args.experimental_websearch and HAS_DDG:
+        ollama_timeout = _get_model_specific_timeout(model, args.ollama_timeout)
+        tools = get_tools()
+        
         return chat_with_tools(
             model=model,
             messages=messages,
-            tools=get_tools(),
+            tools=tools,
             file_handle=file_handle,
             retry_config=retry_config,
-            render_delay=args.render_delay
+            render_delay=args.render_delay,
+            tool_timeout=args.tool_timeout,
+            web_search_timeout=args.web_search_timeout,
+            ollama_timeout=ollama_timeout,
+            ollama_first_token_timeout=args.ollama_first_token_timeout,
+            ollama_stream_idle_timeout=args.ollama_stream_idle_timeout,
+            tool_output_dir=args.tool_output_dir,
+            spinner_enabled=args.spinner_enabled,
+            spinner_style=args.spinner_style,
+            spinner_interval=args.spinner_interval,
+            spinner_stall_delay=args.spinner_stall_delay
         )
 
     print(f"{model}: ", end="", flush=True)
@@ -869,7 +1837,13 @@ def _run_chat_turn(
     stream = _stream_chat_with_retry(
         model=model,
         messages=messages,
-        config=retry_config
+        config=retry_config,
+        start_timeout=args.ollama_first_token_timeout,
+        idle_timeout=args.ollama_stream_idle_timeout,
+        spinner_enabled=args.spinner_enabled,
+        spinner_style=args.spinner_style,
+        spinner_interval=args.spinner_interval,
+        spinner_stall_delay=args.spinner_stall_delay
     )
 
     for chunk in stream:
@@ -909,6 +1883,7 @@ def _respond_with_fallbacks(
 
 def main() -> None:
     args = parse_arguments()
+    _apply_runtime_config(args)
 
     # ------------------------------------------------------------
     # Session handling commands (list, select, export)
@@ -1052,9 +2027,11 @@ def main() -> None:
                 return
             
             try:
+                extensions = [ext.strip() for ext in args.context_grep.split(',')]
                 context_content = load_context_from_database(
                     db_manager, 
-                    additional_paths=context_config['paths']
+                    additional_paths=context_config['paths'],
+                    extensions=extensions
                 )
                 if context_content:
                     # Add context as a system message
@@ -1204,6 +2181,10 @@ def main() -> None:
             except:
                 pass
 
-if __name__ == "__main__":
+def entry_point():
+    """Entry point for uv run and direct execution."""
     main()
-# Database integration complete. Conversations can now be persisted to PostgreSQL with --persist-to-db flag and loaded with --context db.
+
+
+if __name__ == "__main__":
+    entry_point()

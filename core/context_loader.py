@@ -92,7 +92,8 @@ def load_context_files(context_path: str, extensions: List[str]) -> str:
 def load_context_from_database(
     db_manager: Any, 
     additional_paths: Optional[List[str]] = None,
-    limit: Optional[int] = None
+    limit: Optional[int] = None,
+    extensions: Optional[List[str]] = None
 ) -> str:
     """Load context from database and optionally from additional file paths.
     
@@ -124,9 +125,10 @@ def load_context_from_database(
     
     # Load from additional paths
     if additional_paths:
+        load_extensions = extensions or ['txt', 'log']
         for path in additional_paths:
             if path and path != 'db':
-                content = load_context_files(path, ['txt', 'log'])
+                content = load_context_files(path, load_extensions)
                 if content:
                     context_parts.append(f"=== File Context: {path} ===\n{content}\n")
     

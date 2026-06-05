@@ -1,0 +1,77 @@
+12 months of "doing SEO."
+68 blog posts. $50K spent. A fancy agency with weekly reports.
+Result?
+73 clicks/day. Zero demos from organic. CAC stuck at $847.
+Then we took over.
+4 months later:
+→ 2,500+ clicks/day
+→ 312 organic demos/month
+→ CAC dropped to $143
+→ $1.2M pipeline from organic
+→ 4,200+ AI citations across Google AI Overview, ChatGPT and Perplexity
+They're not just ranking.
+They're THE answer buyers find before they start comparing.
+This was an email marketing SaaS.
+$3M ARR. Good product. 94% of pipeline from paid ads.
+The problem?
+TOFU content attracts readers.
+BOFU content attracts buyers.
+They had zero BOFU presence.
+Every "vs" page? Competitors.
+Every "alternative to X" search? Competitors.
+Every buyer-intent query? Competitors.
+They were feeding their competitors' pipeline.
+3 fatal issues:
+1/ No semantic architecture
+↳ 68 posts floating in isolation
+↳ No central entity connecting content
+↳ Google saw topics, not authority
+2/ Wrong content, wrong intent
+↳ 80% TOFU targeting browsers
+↳ 0 pages filling commercial frame slots
+↳ Missing the queries buyers actually search
+3/ No entity signals
+↳ Google couldn't answer: "What is this company an authority on?"
+↳ Invisible to LLMs: not recognized as a citable source
+They had content. Not a semantic content network.
+Here's what we did:
+Month 1: Authority Audit
+Mapped buyer journey to search intent. Found 12 BOFU keywords competitors ignored.
+Month 2: Semantic Architecture
+Pillar-cluster structure. Internal linking based on buyer logic. 6 definitive guides targeting decision-stage queries.
+Month 3: BOFU Blitz
+Comparison pages for every competitor. "Alternative to X" pages. Product-led content for buyers, not browsers.
+Month 4: Compound Effect
+BOFU pages ranked. Demos tripled.
+The inflection hit Week 11.
+One pillar: position 47 → 3.
+Internal links kicked in. Clusters pulled each other up.
+Then pipeline followed.
+Traffic:
+→ 2,500+ clicks/day (was 73)
+→ 157K clicks
+→ Ranking above ConvertKit for 23 terms
+Pipeline:
+→ 312 demos/month from organic (was 0)
+→ 41% of pipeline now from SEO
+→ CAC: $847 → $143
+→ $1.2M pipeline (Month 4-6)
+AI visibility:
+→ 4,200+ citations (Google AI Overview, ChatGPT, Perplexity)
+No link building. No PR stunts.
+Just semantic architecture + topical authority + BOFU strategy.
+Organic became their #1 pipeline channel in 4 months.
+We've done this for 40+ SaaS companies.
+↳ 3-5x organic demos in 6 months
+↳ 40-60% CAC reduction
+↳ 25-45% of pipeline from organic
+I call it the 'Authority Search-to-Pipeline Engine'.
+Most agencies optimize for traffic.
+We turn Google (and AI) into your highest-converting sales channel.
+Want the full breakdown?
+I wrote a 2,800+ word deep-dive covering:
+→ The semantic mapping process we used
+→ BOFU framework that finds hidden pipeline
+→ How we structure content for demos, not clicks
+→ How we hit 4,200+ AI citations
+Comment "PIPELINE" and I'll send it.

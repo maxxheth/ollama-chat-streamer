@@ -135,6 +135,20 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--tool-output-dir",
+        type=str,
+        default=os.environ.get("TOOL_OUTPUT_DIR", "sessions"),
+        help="Base directory for tool-generated output files (default: ./sessions or env TOOL_OUTPUT_DIR)"
+    )
+
+    parser.add_argument(
+        "--ollama-timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds for non-stream Ollama calls (env OLLAMA_TIMEOUT)"
+    )
+
+    parser.add_argument(
         "--retry-max-attempts",
         type=int,
         default=_parse_env_int("RETRY_MAX_ATTEMPTS", 3),

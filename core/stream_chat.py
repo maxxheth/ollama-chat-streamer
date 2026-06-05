@@ -1,5 +1,7 @@
 # Import Ollama client; provide a lightweight stub if the package is missing.
-from typing import Any, Dict, List, Optional, TextIO, Iterable
+from typing import Any, Dict, List, Optional, TextIO, Iterable, Callable
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+import time
 
 try:
     import ollama
@@ -35,6 +37,18 @@ except ImportError:  # pragma: no cover
 
     ollama: Any = _OllamaStub()
 
+
+def _run_with_timeout(action: Callable[[], Any], timeout_s: Optional[float], timeout_message: str) -> Any:
+    """Execute an action with a timeout."""
+    if timeout_s is None or timeout_s <= 0:
+        return action()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(action)
+        try:
+            return future.result(timeout=timeout_s)
+        except FuturesTimeoutError:
+            raise TimeoutError(timeout_message)
+
 # Tool handling moved to core.tool_executor
 from typing import List, Optional, Dict, Any, TextIO, Callable, Iterable
 import argparse
@@ -56,24 +70,108 @@ from core.tool_executor import (
 from core.argument_parser import parse_arguments
 from core.context_loader import parse_context_arg, load_context_files, load_context_from_database
 from core.session_manager import list_sessions, select_session, export_session
-# Implement chat_with_tools locally to avoid importing the top‑level script (which requires the optional ``ollama`` package).
+
+
+def _supports_lfm2_tool_format(model: str) -> bool:
+    """Check if model is LFM2.x which prefers tools in system prompt."""
+    return model.lower().startswith("lfm2")
+
+
+def _format_tools_for_lfm2(tools: List[Dict[str, Any]]) -> str:
+    """Format tools as JSON string for LFM2.5 system prompt."""
+    simplified_tools = []
+    for tool in tools:
+        if tool.get("type") == "function":
+            func = tool.get("function", {})
+            simplified_tools.append({
+                "name": func.get("name", ""),
+                "description": func.get("description", ""),
+                "parameters": func.get("parameters", {})
+            })
+    return json.dumps(simplified_tools, indent=2)
+
+
+def _prepare_messages_for_lfm2(
+    messages: List[Dict[str, str]],
+    tools: List[Dict[str, Any]]
+) -> List[Dict[str, str]]:
+    """Prepare messages with tools in system prompt for LFM2.5."""
+    tools_json = _format_tools_for_lfm2(tools)
+    system_content = f"List of tools: {tools_json}"
+    
+    has_system = any(msg.get("role") == "system" for msg in messages)
+    
+    if has_system:
+        new_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                existing_content = msg.get("content", "")
+                msg = msg.copy()
+                msg["content"] = f"{existing_content}\n\n{system_content}"
+            new_messages.append(msg)
+        return new_messages
+    else:
+        return [{"role": "system", "content": system_content}] + messages
+
+
+def _get_model_specific_timeout(model: str, base_timeout: Optional[float]) -> float:
+    """Get adjusted timeout for models that need more time for tool selection."""
+    if base_timeout is not None:
+        return base_timeout
+    if model.lower().startswith("lfm2"):
+        return 120.0
+    return 60.0
+
+
 def chat_with_tools(
     model: str,
     messages: List[Dict[str, str]],
     tools: List[Dict[str, Any]],
     file_handle: TextIO,
     retry_config: RetryConfig,
+    tool_output_dir: Optional[str] = None,
+    ollama_timeout: Optional[float] = None,
 ) -> str:
     """Chat with the model, handling tool calls automatically.
 
     This mirrors the original implementation from ``stream_chat.py`` but uses the
     locally imported ``execute_tool_call`` and ``log_to_file`` helpers.
     """
+    # Inject a system prompt so small models know to use their tools
+    tool_names = [t["function"]["name"] for t in tools if t.get("type") == "function"]
+    if tool_names:
+        tool_instruction = (
+            "You are a helpful assistant with access to tools. "
+            "You MUST use your tools when they can help answer the question — "
+            "do NOT say you cannot help when a tool would provide the answer. "
+            f"Available tools: {', '.join(tool_names)}. "
+            "For real-time or current information, use web_search or run_shell. "
+            "For file operations, use read_file, write_file, or list_directory. "
+            "For shell commands, use run_shell."
+        )
+        has_system = any(msg.get("role") == "system" for msg in messages)
+        if has_system:
+            for msg in messages:
+                if msg.get("role") == "system":
+                    msg["content"] = f"{tool_instruction}\n\n{msg.get('content', '')}"
+                    break
+        else:
+            messages.insert(0, {"role": "system", "content": tool_instruction})
+
+    # LFM2.5 works best with think=False for faster tool calls
+    use_think_false = _supports_lfm2_tool_format(model)
+    
+    # Get model-specific timeout
+    timeout = _get_model_specific_timeout(model, ollama_timeout)
+    
     # First call – let the model decide if it needs tools
-    response = _retry_call(
-        lambda: ollama.chat(model=model, messages=messages, tools=tools),
-        retry_config,
-    )
+    def chat_call():
+        kwargs = {}
+        if use_think_false:
+            kwargs['think'] = False
+        return ollama.chat(model=model, messages=messages, tools=tools, **kwargs)
+    
+    response = _run_with_timeout(chat_call, timeout, "Ollama tool selection call timed out")
 
     message = response.message
 
@@ -106,7 +204,7 @@ def chat_with_tools(
                     "name": tool_call.function.name,
                     "arguments": tool_call.function.arguments,
                 }
-            })
+            }, output_dir=tool_output_dir)
             messages.append({
                 "role": "tool",
                 "content": result,
@@ -210,6 +308,16 @@ def _get_retry_config_from_args(args: argparse.Namespace) -> RetryConfig:
     )
 
 
+def _get_retry_config_from_args(args: argparse.Namespace) -> RetryConfig:
+    return RetryConfig(
+        max_attempts=max(1, args.retry_max_attempts),
+        initial_delay=max(0.0, args.retry_initial_delay),
+        max_delay=max(0.0, args.retry_max_delay),
+        multiplier=max(1.0, args.retry_multiplier),
+        jitter=max(0.0, args.retry_jitter),
+    )
+
+
 def _run_chat_turn(
     model: str,
     messages: List[Dict[str, str]],
@@ -223,7 +331,9 @@ def _run_chat_turn(
             messages=messages,
             tools=get_tools(),
             file_handle=file_handle,
-            retry_config=retry_config
+            retry_config=retry_config,
+            tool_output_dir=args.tool_output_dir,
+            ollama_timeout=args.ollama_timeout
         )
 
     print(f"{model}: ", end="", flush=True)
