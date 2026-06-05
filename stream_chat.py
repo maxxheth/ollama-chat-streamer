@@ -1,26 +1,28 @@
-import ollama
-import sys
-import os
 import argparse
-import json
 import csv
-import glob
-import time
-import random
-import threading
+import json
+import os
 import queue
+import random
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from pathlib import Path
-from datetime import datetime
-from dataclasses import dataclass
-from typing import List, Dict, TextIO, Any, Optional, Callable, Iterable, Tuple
-from dotenv import load_dotenv
+import sys
 import textwrap
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, TextIO, Tuple
+
+import ollama
+from dotenv import load_dotenv
 
 # Optional nice interactive menu library. If unavailable we fall back to a simple prompt.
 try:
     import questionary  # type: ignore
+
     HAS_QUESTIONARY = True
 except ImportError:
     HAS_QUESTIONARY = False
@@ -33,7 +35,8 @@ load_dotenv()
 # ==============================
 # Import database module
 try:
-    from db import get_database_manager, Conversation
+    from db import Conversation, get_database_manager
+
     HAS_DB = True
 except ImportError:
     HAS_DB = False
@@ -41,10 +44,12 @@ except ImportError:
 # Attempt to import DuckDuckGo for web search
 try:
     from ddgs import DDGS
+
     HAS_DDG = True
 except ImportError:
     try:
         from duckduckgo_search import DDGS
+
         HAS_DDG = True
     except ImportError:
         HAS_DDG = False
@@ -52,6 +57,7 @@ except ImportError:
 # Optional YAML config support
 try:
     import yaml  # type: ignore
+
     HAS_YAML = True
 except ImportError:
     HAS_YAML = False
@@ -111,7 +117,7 @@ def _backoff_delay(base_delay: float, jitter: float) -> float:
 def _retry_call(
     action: Callable[[], Any],
     config: RetryConfig,
-    on_retry: Optional[Callable[[int, Exception, float], None]] = None
+    on_retry: Optional[Callable[[int, Exception, float], None]] = None,
 ) -> Any:
     attempts = max(1, config.max_attempts)
     delay = max(0.0, config.initial_delay)
@@ -129,10 +135,7 @@ def _retry_call(
 
 
 def _stream_chat_with_retry(
-    model: str,
-    messages: List[Dict[str, str]],
-    config: RetryConfig,
-    **kwargs: Any
+    model: str, messages: List[Dict[str, str]], config: RetryConfig, **kwargs: Any
 ) -> Iterable[Dict[str, Any]]:
     attempts = max(1, config.max_attempts)
     delay = max(0.0, config.initial_delay)
@@ -147,7 +150,7 @@ def _stream_chat_with_retry(
                 spinner_style=kwargs.pop("spinner_style", "line"),
                 spinner_interval=kwargs.pop("spinner_interval", 0.1),
                 spinner_stall_delay=kwargs.pop("spinner_stall_delay", 1.5),
-                **kwargs
+                **kwargs,
             )
             for chunk in stream:
                 yield chunk
@@ -156,12 +159,18 @@ def _stream_chat_with_retry(
             if attempt >= attempts:
                 raise
             sleep_time = _backoff_delay(min(config.max_delay, delay), config.jitter)
-            print(f"\n[Retry {attempt}/{attempts} after error: {exc}] Waiting {sleep_time:.2f}s...")
+            print(
+                f"\n  retry {attempt}/{attempts} ({exc}; waiting {sleep_time:.1f}s)...",
+                end="",
+                flush=True,
+            )
             time.sleep(sleep_time)
             delay = min(config.max_delay, delay * max(1.0, config.multiplier))
 
 
-def _run_with_timeout(action: Callable[[], Any], timeout_s: Optional[float], timeout_message: str) -> Any:
+def _run_with_timeout(
+    action: Callable[[], Any], timeout_s: Optional[float], timeout_message: str
+) -> Any:
     if timeout_s is None or timeout_s <= 0:
         return action()
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -179,7 +188,7 @@ class Spinner:
         enabled: bool = True,
         style: str = "line",
         interval: float = 0.1,
-        stream: Optional[TextIO] = None
+        stream: Optional[TextIO] = None,
     ) -> None:
         self.message = message
         self.enabled = enabled
@@ -233,14 +242,16 @@ def _stream_ollama_chat_with_timeouts(
     spinner_style: str,
     spinner_interval: float,
     spinner_stall_delay: float,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> Iterable[Dict[str, Any]]:
     q: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
     stop_event = threading.Event()
 
     def worker() -> None:
         try:
-            for chunk in ollama.chat(model=model, messages=messages, stream=True, **kwargs):
+            for chunk in ollama.chat(
+                model=model, messages=messages, stream=True, **kwargs
+            ):
                 if stop_event.is_set():
                     break
                 q.put(("chunk", chunk))
@@ -257,7 +268,7 @@ def _stream_ollama_chat_with_timeouts(
         message="Waiting for response",
         enabled=spinner_enabled,
         style=spinner_style,
-        interval=spinner_interval
+        interval=spinner_interval,
     )
 
     def start_spinner_after(delay: float) -> Optional[threading.Timer]:
@@ -348,7 +359,7 @@ def _resolve_float(
     env_name: str,
     yaml_data: Dict[str, Any],
     yaml_keys: Tuple[str, ...],
-    default: float
+    default: float,
 ) -> float:
     if cli_value is not None:
         return cli_value
@@ -373,7 +384,7 @@ def _resolve_bool(
     env_name: str,
     yaml_data: Dict[str, Any],
     yaml_keys: Tuple[str, ...],
-    default: bool
+    default: bool,
 ) -> bool:
     if cli_true:
         return True
@@ -393,7 +404,7 @@ def _resolve_str(
     env_name: str,
     yaml_data: Dict[str, Any],
     yaml_keys: Tuple[str, ...],
-    default: str
+    default: str,
 ) -> str:
     if cli_value:
         return cli_value
@@ -403,6 +414,30 @@ def _resolve_str(
     yaml_value = _yaml_get(yaml_data, *yaml_keys)
     if yaml_value is not None:
         return str(yaml_value)
+    return default
+
+
+def _resolve_int(
+    cli_value: Optional[int],
+    env_name: str,
+    yaml_data: Dict[str, Any],
+    yaml_keys: Tuple[str, ...],
+    default: int,
+) -> int:
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get(env_name)
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            return default
+    yaml_value = _yaml_get(yaml_data, *yaml_keys)
+    if yaml_value is not None:
+        try:
+            return int(yaml_value)
+        except (ValueError, TypeError):
+            return default
     return default
 
 
@@ -425,9 +460,9 @@ def _ensure_model_available(model: str, config: RetryConfig) -> None:
 
 
 # Tool schema for Ollama
-def get_tools() -> List[Dict[str, Any]]:
+def get_tools(max_subagent_depth: int = 1) -> List[Dict[str, Any]]:
     """Returns the list of available tools for the model."""
-    return [
+    tools = [
         {
             "type": "function",
             "function": {
@@ -438,39 +473,39 @@ def get_tools() -> List[Dict[str, Any]]:
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "The search query to look up on the web"
+                            "description": "The search query to look up on the web",
                         }
                     },
-                    "required": ["query"]
-                }
-            }
+                    "required": ["query"],
+                },
+            },
         },
         {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a text file. Supports any text-based file format (txt, md, py, json, yaml, etc.). Use this when the user asks you to read or examine a file.",
+                "description": "Read the contents of a text file. Supports any text-based file format. Files over 512 KB are rejected — use start_line/max_lines to read in chunks. Default returns up to 200 lines.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "Path to the file to read"
+                            "description": "Path to the file to read",
                         },
                         "max_lines": {
                             "type": "integer",
-                            "description": "Maximum number of lines to read (default: 1000, use -1 for all)",
-                            "default": 1000
+                            "description": "Maximum number of lines to read (default: 200)",
+                            "default": 200,
                         },
                         "start_line": {
                             "type": "integer",
                             "description": "Starting line number (1-indexed, default: 1)",
-                            "default": 1
-                        }
+                            "default": 1,
+                        },
                     },
-                    "required": ["file_path"]
-                }
-            }
+                    "required": ["file_path"],
+                },
+            },
         },
         {
             "type": "function",
@@ -480,14 +515,28 @@ def get_tools() -> List[Dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "file_path": {"type": "string", "description": "Path to the JSON file to read"},
-                        "max_entries": {"type": "integer", "description": "Maximum number of entries to read (default: 100, use -1 for all)", "default": 100},
-                        "query_filter": {"type": "string", "description": "Optional dot/array path filter (e.g., 'conversations[*].messages[*].content')"},
-                        "return_summary": {"type": "boolean", "description": "If true, return a summary instead of full data", "default": False}
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to the JSON file to read",
+                        },
+                        "max_entries": {
+                            "type": "integer",
+                            "description": "Maximum number of entries to read (default: 100, use -1 for all)",
+                            "default": 100,
+                        },
+                        "query_filter": {
+                            "type": "string",
+                            "description": "Optional dot/array path filter (e.g., 'conversations[*].messages[*].content')",
+                        },
+                        "return_summary": {
+                            "type": "boolean",
+                            "description": "If true, return a summary instead of full data",
+                            "default": False,
+                        },
                     },
-                    "required": ["file_path"]
-                }
-            }
+                    "required": ["file_path"],
+                },
+            },
         },
         {
             "type": "function",
@@ -499,21 +548,21 @@ def get_tools() -> List[Dict[str, Any]]:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "File path to write to"
+                            "description": "File path to write to",
                         },
                         "content": {
                             "type": "string",
-                            "description": "The content to write to the file"
+                            "description": "The content to write to the file",
                         },
                         "create_dirs": {
                             "type": "boolean",
                             "description": "If true, create parent directories if they don't exist (default: true)",
-                            "default": True
-                        }
+                            "default": True,
+                        },
                     },
-                    "required": ["file_path", "content"]
-                }
-            }
+                    "required": ["file_path", "content"],
+                },
+            },
         },
         {
             "type": "function",
@@ -525,21 +574,21 @@ def get_tools() -> List[Dict[str, Any]]:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "File path to append to"
+                            "description": "File path to append to",
                         },
                         "content": {
                             "type": "string",
-                            "description": "The content to append to the file"
+                            "description": "The content to append to the file",
                         },
                         "add_newline": {
                             "type": "boolean",
                             "description": "If true, add a newline before appending (default: true)",
-                            "default": True
-                        }
+                            "default": True,
+                        },
                     },
-                    "required": ["file_path", "content"]
-                }
-            }
+                    "required": ["file_path", "content"],
+                },
+            },
         },
         {
             "type": "function",
@@ -551,22 +600,22 @@ def get_tools() -> List[Dict[str, Any]]:
                     "properties": {
                         "directory_path": {
                             "type": "string",
-                            "description": "Path to the directory to list"
+                            "description": "Path to the directory to list",
                         },
                         "pattern": {
                             "type": "string",
                             "description": "Optional glob pattern to filter results (e.g., '*.py', '*.md')",
-                            "default": "*"
+                            "default": "*",
                         },
                         "recursive": {
                             "type": "boolean",
                             "description": "If true, list files recursively (default: false)",
-                            "default": False
-                        }
+                            "default": False,
+                        },
                     },
-                    "required": ["directory_path"]
-                }
-            }
+                    "required": ["directory_path"],
+                },
+            },
         },
         {
             "type": "function",
@@ -578,30 +627,72 @@ def get_tools() -> List[Dict[str, Any]]:
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "The shell command to execute"
+                            "description": "The shell command to execute",
                         },
                         "timeout": {
                             "type": "integer",
                             "description": "Timeout in seconds (default: 30)",
-                            "default": 30
+                            "default": 30,
                         },
                         "workdir": {
                             "type": "string",
-                            "description": "Working directory for the command (default: current directory)"
-                        }
+                            "description": "Working directory for the command (default: current directory)",
+                        },
                     },
-                    "required": ["command"]
-                }
-            }
-        }
+                    "required": ["command"],
+                },
+            },
+        },
     ]
+
+    if max_subagent_depth > 0:
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "spawn_agent",
+                "description": "Spawn a subagent to handle a task autonomously. The subagent can use read_file, write_file, append_file, list_directory, run_shell, and web_search to complete the task. It works through the task step by step and returns a final answer. Use this for complex multi-step tasks like analyzing files, running investigation sequences, or parallel research.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "Clear description of what the subagent should accomplish"
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "Optional additional context: file paths, constraints, or hints to help the subagent"
+                        },
+                    },
+                    "required": ["task"],
+                },
+            },
+        })
+
+    return tools
 
 
 def execute_tool_call(
     tool_call: Dict[str, Any],
     tool_timeout: Optional[float] = None,
     web_search_timeout: Optional[float] = None,
-    output_dir: Optional[str] = None
+    output_dir: Optional[str] = None,
+    read_file_max_bytes: int = 512_000,
+    read_file_max_lines: int = 200,
+    read_file_max_content: int = 64_000,
+    # Subagent parameters
+    subagent_model: Optional[str] = None,
+    subagent_retry_config: Optional[RetryConfig] = None,
+    subagent_max_rounds: int = 5,
+    subagent_current_depth: int = 1,
+    subagent_max_depth: int = 1,
+    subagent_tools: Optional[List[Dict[str, Any]]] = None,
+    subagent_ollama_timeout: Optional[float] = None,
+    subagent_first_token_timeout: Optional[float] = None,
+    subagent_stream_idle_timeout: Optional[float] = None,
+    subagent_tool_timeout: Optional[float] = None,
+    subagent_web_search_timeout: Optional[float] = None,
+    subagent_tool_output_dir: Optional[str] = None,
+    subagent_think_setting: str = "auto",
 ) -> str:
     """Execute a tool call and return the result."""
     function_name = tool_call.get("function", {}).get("name")
@@ -610,15 +701,15 @@ def execute_tool_call(
         arguments = raw_arguments
     else:
         arguments = json.loads(raw_arguments)
-    
+
     if function_name == "web_search":
         query = arguments.get("query", "")
-        timeout_s = web_search_timeout if web_search_timeout is not None else tool_timeout
+        timeout_s = (
+            web_search_timeout if web_search_timeout is not None else tool_timeout
+        )
         try:
             return _run_with_timeout(
-                lambda: perform_web_search(query),
-                timeout_s,
-                "web_search timed out"
+                lambda: perform_web_search(query), timeout_s, "web_search timed out"
             )
         except TimeoutError:
             return "[Web Search Timeout: exceeded configured limit]"
@@ -628,11 +719,13 @@ def execute_tool_call(
             return _run_with_timeout(
                 lambda: read_file(
                     file_path=arguments.get("file_path", ""),
-                    max_lines=int(arguments.get("max_lines", 1000)),
+                    max_lines=int(arguments.get("max_lines", read_file_max_lines)),
                     start_line=int(arguments.get("start_line", 1)),
+                    max_bytes=read_file_max_bytes,
+                    max_content=read_file_max_content,
                 ),
                 tool_timeout,
-                "read_file timed out"
+                "read_file timed out",
             )
         except TimeoutError:
             return "[Tool Timeout: read_file exceeded configured limit]"
@@ -644,10 +737,10 @@ def execute_tool_call(
                     file_path=arguments.get("file_path", ""),
                     max_entries=int(arguments.get("max_entries", 100)),
                     query_filter=arguments.get("query_filter", ""),
-                    return_summary=bool(arguments.get("return_summary", False))
+                    return_summary=bool(arguments.get("return_summary", False)),
                 ),
                 tool_timeout,
-                "read_json_file timed out"
+                "read_json_file timed out",
             )
         except TimeoutError:
             return "[Tool Timeout: read_json_file exceeded configured limit]"
@@ -682,7 +775,7 @@ def execute_tool_call(
                     workdir=arguments.get("workdir"),
                 ),
                 tool_timeout,
-                "run_shell timed out"
+                "run_shell timed out",
             )
         except TimeoutError:
             return "[Tool Timeout: run_shell exceeded configured limit]"
@@ -690,13 +783,174 @@ def execute_tool_call(
         file_path = arguments.get("file_path", "")
         content = arguments.get("content", "")
         return write_output_file(
-            file_path=file_path,
-            content=content,
-            output_dir=output_dir
+            file_path=file_path, content=content, output_dir=output_dir
         )
-    
+
+    if function_name == "spawn_agent":
+        task = arguments.get("task", "")
+        context = arguments.get("context", "")
+        if not task:
+            return "[Error: task is required for spawn_agent]"
+        if not subagent_model:
+            return "[Error: subagent model not configured]"
+        if not subagent_tools:
+            subagent_tools = get_tools(max_subagent_depth=max(0, subagent_max_depth))
+        if not subagent_retry_config:
+            subagent_retry_config = RetryConfig(max_attempts=2, initial_delay=1.0, max_delay=10.0, multiplier=2.0, jitter=0.1)
+        try:
+            return _run_with_timeout(
+                lambda: run_subagent(
+                    task=task,
+                    context=context,
+                    model=subagent_model,
+                    tools=subagent_tools,
+                    retry_config=subagent_retry_config,
+                    max_rounds=subagent_max_rounds,
+                    current_depth=subagent_current_depth,
+                    max_depth=subagent_max_depth,
+                    tool_timeout=subagent_tool_timeout or tool_timeout,
+                    web_search_timeout=subagent_web_search_timeout or web_search_timeout,
+                    ollama_timeout=subagent_ollama_timeout,
+                    ollama_first_token_timeout=subagent_first_token_timeout,
+                    ollama_stream_idle_timeout=subagent_stream_idle_timeout,
+                    tool_output_dir=subagent_tool_output_dir or output_dir,
+                    read_file_max_bytes=read_file_max_bytes,
+                    read_file_max_lines=read_file_max_lines,
+                    read_file_max_content=read_file_max_content,
+                    think_setting=subagent_think_setting,
+                ),
+                tool_timeout,
+                "spawn_agent timed out"
+            )
+        except TimeoutError:
+            return "[Tool Timeout: spawn_agent exceeded configured limit]"
+
     return f"[Error: Unknown tool '{function_name}']"
-    return f"[Error: Unknown tool '{function_name}']"
+
+
+SUBAGENT_SYSTEM_PROMPT = (
+    "You are a subagent working on a specific task. "
+    "Use your available tools to complete the task step by step. "
+    "When you have the answer, respond directly with it — do not ask follow-up questions. "
+    "Be thorough but concise. If a tool call fails, try a different approach."
+)
+
+
+def run_subagent(
+    task: str,
+    context: str,
+    model: str,
+    tools: List[Dict[str, Any]],
+    retry_config: RetryConfig,
+    max_rounds: int = 5,
+    current_depth: int = 1,
+    max_depth: int = 1,
+    tool_timeout: Optional[float] = None,
+    web_search_timeout: Optional[float] = None,
+    ollama_timeout: Optional[float] = None,
+    ollama_first_token_timeout: Optional[float] = None,
+    ollama_stream_idle_timeout: Optional[float] = None,
+    tool_output_dir: Optional[str] = None,
+    read_file_max_bytes: int = 512_000,
+    read_file_max_lines: int = 200,
+    read_file_max_content: int = 64_000,
+    think_setting: str = "auto",
+) -> str:
+    """Run a subagent agentic loop to complete a task."""
+    if current_depth > max_depth:
+        return "[Error: Maximum subagent depth reached]"
+
+    subagent_tools = [t for t in tools if t.get("function", {}).get("name") != "spawn_agent"]
+
+    user_message = task
+    if context:
+        user_message = f"{task}\n\nAdditional context:\n{context}"
+
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": SUBAGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    print(f"\n  [Subagent depth={current_depth}] Starting: {task[:80]}{'...' if len(task) > 80 else ''}")
+
+    for round_num in range(1, max_rounds + 1):
+        try:
+            kwargs = get_think_kwargs(model, think_setting)
+
+            if not subagent_tools:
+                resp = ollama.chat(model=model, messages=messages, **kwargs)
+            else:
+                resp = ollama.chat(model=model, messages=messages, tools=subagent_tools, **kwargs)
+        except Exception as e:
+            print(f"  [Subagent] Model error on round {round_num}: {e}")
+            return f"[Subagent error on round {round_num}: {e}]"
+
+        message = resp.message
+
+        if not (hasattr(message, 'tool_calls') and message.tool_calls):
+            final_text = message.content or ""
+            if message.content:
+                messages.append({"role": "assistant", "content": message.content})
+            tool_count = sum(1 for m in messages if m.get("role") == "tool")
+            print(f"  [Subagent depth={current_depth}] Complete ({round_num} round{'s' if round_num != 1 else ''}, {tool_count} tool call{'s' if tool_count != 1 else ''})")
+            return final_text
+
+        tool_calls_list = message.tool_calls if hasattr(message, 'tool_calls') else []
+
+        tool_calls_payload = []
+        for tc in tool_calls_list:
+            tc_function = getattr(tc, "function", None)
+            if isinstance(tc, dict):
+                tc_function = tc.get("function")
+            tc_name = getattr(tc_function, "name", None) or (tc_function.get("name") if isinstance(tc_function, dict) else None)
+            tc_args = getattr(tc_function, "arguments", None) or (tc_function.get("arguments") if isinstance(tc_function, dict) else None)
+            tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else None)
+            tool_calls_payload.append({
+                "type": "function",
+                "function": {"name": tc_name, "arguments": tc_args},
+            })
+            if tc_id is not None:
+                tool_calls_payload[-1]["id"] = tc_id
+
+        assistant_msg: Dict[str, Any] = {
+            "role": "assistant",
+            "content": message.content or "",
+            "tool_calls": tool_calls_payload,
+        }
+        messages.append(assistant_msg)
+
+        for tc in tool_calls_list:
+            tc_function = getattr(tc, "function", None)
+            if isinstance(tc, dict):
+                tc_function = tc.get("function")
+            tc_name = getattr(tc_function, "name", None) or (tc_function.get("name") if isinstance(tc_function, dict) else None)
+            tc_args = getattr(tc_function, "arguments", None) or (tc_function.get("arguments") if isinstance(tc_function, dict) else None)
+            tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else None)
+
+            print(f"  [Subagent depth={current_depth}] Round {round_num}/{max_rounds} → {tc_name}")
+
+            tool_result = execute_tool_call(
+                {"function": {"name": tc_name, "arguments": tc_args}},
+                tool_timeout=tool_timeout,
+                web_search_timeout=web_search_timeout,
+                output_dir=tool_output_dir,
+                read_file_max_bytes=read_file_max_bytes,
+                read_file_max_lines=read_file_max_lines,
+                read_file_max_content=read_file_max_content,
+            )
+
+            tool_message: Dict[str, Any] = {"role": "tool", "content": tool_result}
+            if tc_id is not None:
+                tool_message["tool-call_id"] = tc_id
+            messages.append(tool_message)
+
+    print(f"  [Subagent depth={current_depth}] Max rounds ({max_rounds}) reached")
+    last_assistant = ""
+    for m in reversed(messages):
+        if m.get("role") == "assistant" and m.get("content"):
+            last_assistant = m["content"]
+            break
+    return last_assistant or f"[Subagent reached max rounds ({max_rounds}) without a final answer]"
 
 
 def chat_with_tools(
@@ -715,7 +969,13 @@ def chat_with_tools(
     spinner_enabled: bool = True,
     spinner_style: str = "line",
     spinner_interval: float = 0.1,
-    spinner_stall_delay: float = 1.5
+    spinner_stall_delay: float = 1.5,
+    read_file_max_bytes: int = 512_000,
+    read_file_max_lines: int = 200,
+    read_file_max_content: int = 64_000,
+    max_subagent_depth: int = 1,
+    max_subagent_rounds: int = 5,
+    think_setting: str = "auto",
 ) -> str:
     """
     Chat with the model, handling tool calls automatically.
@@ -733,6 +993,8 @@ def chat_with_tools(
             "For file operations, use read_file, write_file, or list_directory. "
             "For shell commands, use run_shell."
         )
+        if "spawn_agent" in tool_names:
+            tool_instruction += " For complex multi-step tasks, use spawn_agent to delegate to a subagent."
         has_system = any(msg.get("role") == "system" for msg in messages)
         if has_system:
             for msg in messages:
@@ -747,28 +1009,28 @@ def chat_with_tools(
         message="Waiting for model",
         enabled=spinner_enabled,
         style=spinner_style,
-        interval=spinner_interval
+        interval=spinner_interval,
     )
     selection_spinner.start()
     try:
+
         def chat_call():
-            kwargs = {}
-            # LFM2.5 works best with think=False for tool calling
-            if _supports_lfm2_tool_format(model):
-                kwargs['think'] = False
+            kwargs = get_think_kwargs(model, think_setting)
             return ollama.chat(model=model, messages=messages, tools=tools, **kwargs)
-        
+
         response = _retry_call(
-            lambda: _run_with_timeout(chat_call, ollama_timeout, "Ollama tool selection call timed out"),
-            retry_config
+            lambda: _run_with_timeout(
+                chat_call, ollama_timeout, "Ollama tool selection call timed out"
+            ),
+            retry_config,
         )
     finally:
         selection_spinner.stop()
-    
+
     message = response.message
-    
+
     # Check if the model wants to use tools
-    if hasattr(message, 'tool_calls') and message.tool_calls:
+    if hasattr(message, "tool_calls") and message.tool_calls:
         tool_calls_info = []
         for tc in message.tool_calls:
             tc_function = getattr(tc, "function", None)
@@ -785,11 +1047,13 @@ def chat_with_tools(
             if tc_id is None and isinstance(tc, dict):
                 tc_id = tc.get("id")
 
-            tool_calls_info.append({
-                "id": tc_id,
-                "name": tc_name,
-                "arguments": tc_args,
-            })
+            tool_calls_info.append(
+                {
+                    "id": tc_id,
+                    "name": tc_name,
+                    "arguments": tc_args,
+                }
+            )
 
         tool_names = [info["name"] for info in tool_calls_info if info.get("name")]
         print(f"\n[Tool calls detected: {tool_names}]")
@@ -808,11 +1072,13 @@ def chat_with_tools(
                 payload["id"] = info["id"]
             tool_calls_payload.append(payload)
 
-        messages.append({
-            "role": "assistant",
-            "content": message.content or "",
-            "tool_calls": tool_calls_payload,
-        })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": tool_calls_payload,
+            }
+        )
 
         # Execute each tool call and add results
         for info in tool_calls_info:
@@ -821,23 +1087,43 @@ def chat_with_tools(
                 message=f"Running tool '{tool_name}'",
                 enabled=spinner_enabled,
                 style=spinner_style,
-                interval=spinner_interval
+                interval=spinner_interval,
             )
             spinner.start()
             try:
-                tool_kwargs: Dict[str, Optional[float]] = {}
+                tool_kwargs: Dict[str, Any] = {}
                 if tool_timeout is not None:
                     tool_kwargs["tool_timeout"] = tool_timeout
                 if web_search_timeout is not None:
                     tool_kwargs["web_search_timeout"] = web_search_timeout
                 if tool_output_dir:
                     tool_kwargs["output_dir"] = tool_output_dir
-                result = execute_tool_call({
-                    "function": {
-                        "name": info["name"],
-                        "arguments": info["arguments"],
-                    }
-                }, **tool_kwargs)
+                tool_kwargs["read_file_max_bytes"] = read_file_max_bytes
+                tool_kwargs["read_file_max_lines"] = read_file_max_lines
+                tool_kwargs["read_file_max_content"] = read_file_max_content
+                # Subagent parameters
+                tool_kwargs["subagent_model"] = model
+                tool_kwargs["subagent_retry_config"] = retry_config
+                tool_kwargs["subagent_max_rounds"] = max_subagent_rounds
+                tool_kwargs["subagent_current_depth"] = 1
+                tool_kwargs["subagent_max_depth"] = max_subagent_depth
+                tool_kwargs["subagent_tools"] = get_tools(max_subagent_depth=max_subagent_depth - 1)
+                tool_kwargs["subagent_ollama_timeout"] = ollama_timeout
+                tool_kwargs["subagent_first_token_timeout"] = ollama_first_token_timeout
+                tool_kwargs["subagent_stream_idle_timeout"] = ollama_stream_idle_timeout
+                tool_kwargs["subagent_tool_timeout"] = tool_timeout
+                tool_kwargs["subagent_web_search_timeout"] = web_search_timeout
+                tool_kwargs["subagent_tool_output_dir"] = tool_output_dir
+                tool_kwargs["subagent_think_setting"] = think_setting
+                result = execute_tool_call(
+                    {
+                        "function": {
+                            "name": info["name"],
+                            "arguments": info["arguments"],
+                        }
+                    },
+                    **tool_kwargs,
+                )
             finally:
                 spinner.stop()
 
@@ -851,11 +1137,11 @@ def chat_with_tools(
 
             if info.get("name"):
                 log_to_file(file_handle, f"\n[Tool '{info['name']}' used]\n")
-        
+
         # Second call - get the final response with tool results
         print(f"{model}: ", end="", flush=True)
         log_to_file(file_handle, f"{model}: ")
-        
+
         full_response = ""
         stream = _stream_chat_with_retry(
             model=model,
@@ -866,61 +1152,126 @@ def chat_with_tools(
             spinner_enabled=spinner_enabled,
             spinner_style=spinner_style,
             spinner_interval=spinner_interval,
-            spinner_stall_delay=spinner_stall_delay
+            spinner_stall_delay=spinner_stall_delay,
         )
-        
+
         for chunk in stream:
-            part = chunk['message']['content']
+            part = chunk["message"]["content"]
             render_stream_text(part, file_handle, delay=render_delay)
             full_response += part
-        
+
         return full_response
     else:
         # No tool calls - just stream the response
         print(f"{model}: ", end="", flush=True)
         log_to_file(file_handle, f"{model}: ")
-        
+
         full_response = ""
         # Stream the content if available
         if message.content:
             render_stream_text(message.content, file_handle, delay=render_delay)
             full_response = message.content
-        
+
         return full_response
+
 
 def parse_arguments() -> argparse.Namespace:
     """
     Parses CLI arguments, allowing environment variables to serve as defaults.
     Precedence: CLI Flag > Environment Variable > Default Value
     """
-    parser = argparse.ArgumentParser(description="Stream chat with Ollama models.")
+    parser = argparse.ArgumentParser(
+        description="Stream chat with Ollama models with tool calling support.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  # Basic chat with a model
+  %(prog)s --model llama3
+
+  # Chat with tool calling enabled (web search, file ops, shell)
+  %(prog)s --model lfm2.5 --experimental-websearch
+
+  # Chat with tool calling and database persistence
+  %(prog)s --model lfm2.5 --experimental-websearch --persist-to-db
+
+  # Load context files as background knowledge
+  %(prog)s --model lfm2.5 --experimental-websearch \\
+      --context-path ./docs --context-grep md,txt,py
+
+  # Load chat history from database and continue a session
+  %(prog)s --model lfm2.5 --select-session
+
+  # Use fallback models if the primary model fails
+  %(prog)s --model lfm2.5 \\
+      --model-fallbacks "llama3,mistral"
+
+  # Custom timeouts for slow models
+  %(prog)s --model lfm2.5 --experimental-websearch \\
+      --ollama-timeout 180 --ollama-first-token-timeout 30
+
+  # Export a conversation to JSON
+  %(prog)s --export-session 5 --format json --output conv.json
+
+environment variables:
+  OLLAMA_MODEL              Default model (default: llama3)
+  OLLAMA_MODEL_FALLBACKS    Comma-separated fallback models
+  OLLAMA_HOST               Ollama server URL (default: http://localhost:11434)
+  EXPERIMENTAL_WEBSEARCH    Enable tool calling (true/false)
+  PERSIST_TO_DB             Save conversations to PostgreSQL (true/false)
+  DATABASE_URL              PostgreSQL connection string
+  CHAT_LOG_DEST             Log file path (default: chat_log.txt)
+  CONTEXT_PATH              Default context path
+  TOOL_OUTPUT_DIR           Output directory for tool-generated files
+  SPINNER_ENABLED           Show spinner while waiting (true/false)
+  READ_FILE_MAX_BYTES       Max file size for read_file (default: 512000)
+  READ_FILE_MAX_LINES       Max lines for read_file (default: 200)
+  READ_FILE_MAX_CONTENT     Max chars returned by read_file (default: 64000)
+  MAX_SUBAGENT_DEPTH        Max subagent nesting depth (default: 1, 0=disabled)
+  MAX_SUBAGENT_ROUNDS       Max tool-call rounds per subagent (default: 5)
+  THINK                     Control 'think' param: auto, true, or false (default: auto)
+
+tools available when --experimental-websearch is enabled:
+  web_search       Search the web via DuckDuckGo
+  read_file        Read any text file (with line range support)
+  read_json_file   Parse JSON/NDJSON files with filtering
+  write_file       Create or overwrite files (auto-mkdirs)
+  append_file      Append content to existing files
+  list_directory   List files and directories (with glob filtering)
+  run_shell        Execute shell commands (with timeout)
+  spawn_agent      Spawn a subagent for complex multi-step tasks (enabled with --max-subagent-depth >= 1)
+
+see also:
+  compile.sh       Build a standalone executable with Nuitka
+  .env             Set persistent configuration defaults
+""",
+    )
 
     parser.add_argument(
         "--config",
         type=str,
         default=None,
-        help="Path to YAML config file (env CHAT_CONFIG)."
+        help="Path to YAML config file (env CHAT_CONFIG).",
     )
 
     parser.add_argument(
         "--model",
         type=str,
         default=os.environ.get("OLLAMA_MODEL", "llama3"),
-        help="The Ollama model to use (default: llama3 or env OLLAMA_MODEL)"
+        help="The Ollama model to use (default: llama3 or env OLLAMA_MODEL)",
     )
 
     parser.add_argument(
         "--model-fallbacks",
         type=str,
         default=os.environ.get("OLLAMA_MODEL_FALLBACKS", ""),
-        help="Comma-separated list of fallback models (env OLLAMA_MODEL_FALLBACKS)"
+        help="Comma-separated list of fallback models (env OLLAMA_MODEL_FALLBACKS)",
     )
 
     parser.add_argument(
         "--dest",
         type=str,
         default=os.environ.get("CHAT_LOG_DEST", "chat_log.txt"),
-        help="Path to the log file (default: chat_log.txt or env CHAT_LOG_DEST)"
+        help="Path to the log file (default: chat_log.txt or env CHAT_LOG_DEST)",
     )
 
     # Boolean flags
@@ -930,29 +1281,31 @@ def parse_arguments() -> argparse.Namespace:
         "--experimental",
         action="store_true",
         default=default_experimental,
-        help="Enable experimental features/modes"
+        help="Enable experimental features/modes",
     )
 
-    default_websearch = os.environ.get("EXPERIMENTAL_WEBSEARCH", "false").lower() == "true"
+    default_websearch = (
+        os.environ.get("EXPERIMENTAL_WEBSEARCH", "false").lower() == "true"
+    )
     parser.add_argument(
         "--experimental-websearch",
         action="store_true",
         default=default_websearch,
-        help="Enable experimental web search integration (requires duckduckgo-search)"
+        help="Enable experimental web search integration (requires duckduckgo-search)",
     )
 
     parser.add_argument(
-        "--context",
+        "--context-path",
         type=str,
         default=os.environ.get("CONTEXT_PATH", ""),
-        help="Path to a directory or file to load as historical context for the LLM. Use 'db' to load from database."
+        help="Path to a directory or file to load as historical context for the LLM. Use 'db' to load from database.",
     )
 
     parser.add_argument(
         "--persist-to-db",
         action="store_true",
         default=os.environ.get("PERSIST_TO_DB", "false").lower() == "true",
-        help="Enable saving conversations to PostgreSQL database"
+        help="Enable saving conversations to PostgreSQL database",
     )
 
     # -----------------------------------------------------------------
@@ -961,98 +1314,139 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--list-sessions",
         action="store_true",
-        help="List saved conversation sessions and exit"
+        help="List saved conversation sessions and exit",
     )
     parser.add_argument(
         "--select-session",
         action="store_true",
-        help="Interactively select a saved session to continue"
+        help="Interactively select a saved session to continue",
     )
     parser.add_argument(
         "--export-session",
         type=int,
         metavar="ID",
-        help="Export the conversation with the given ID. Use --format to choose output format."
+        help="Export the conversation with the given ID. Use --format to choose output format.",
     )
     parser.add_argument(
         "--format",
         choices=["sql", "json", "csv", "text"],
         default="json",
-        help="Export format when using --export-session"
+        help="Export format when using --export-session",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="File path to write exported data. If omitted, prints to stdout."
+        help="File path to write exported data. If omitted, prints to stdout.",
     )
 
     parser.add_argument(
         "--context-grep",
         type=str,
         default=os.environ.get("CONTEXT_GREP", "txt,log"),
-        help="Comma-separated list of file extensions to include when loading context from a directory (default: txt,log)"
+        help="Comma-separated list of file extensions to include when loading context from a directory (default: txt,log)",
     )
 
     parser.add_argument(
         "--tool-output-dir",
         type=str,
         default=os.environ.get("TOOL_OUTPUT_DIR", "sessions"),
-        help="Base directory for tool-generated output files (default: ./sessions or env TOOL_OUTPUT_DIR)"
+        help="Base directory for tool-generated output files (default: ./sessions or env TOOL_OUTPUT_DIR)",
     )
 
     parser.add_argument(
         "--render-delay",
         type=float,
         default=_parse_env_float("RENDER_DELAY", 0.0),
-        help="Delay in seconds between rendered characters (default: 0.0 or env RENDER_DELAY)"
+        help="Delay in seconds between rendered characters (default: 0.0 or env RENDER_DELAY)",
     )
 
     parser.add_argument(
         "--tool-timeout",
         type=float,
         default=None,
-        help="Timeout in seconds for any tool call (env TOOL_TIMEOUT, yaml timeouts.tool)"
+        help="Timeout in seconds for any tool call (env TOOL_TIMEOUT, yaml timeouts.tool)",
+    )
+
+    parser.add_argument(
+        "--read-file-max-bytes",
+        type=int,
+        default=None,
+        help="Max file size in bytes for read_file (default: 512000, env READ_FILE_MAX_BYTES, yaml limits.read_file_max_bytes)",
+    )
+
+    parser.add_argument(
+        "--read-file-max-lines",
+        type=int,
+        default=None,
+        help="Max lines for read_file (default: 200, env READ_FILE_MAX_LINES, yaml limits.read_file_max_lines)",
+    )
+
+    parser.add_argument(
+        "--read-file-max-content",
+        type=int,
+        default=None,
+        help="Max content chars returned by read_file (default: 64000, env READ_FILE_MAX_CONTENT, yaml limits.read_file_max_content)",
+    )
+
+    parser.add_argument(
+        "--max-subagent-depth",
+        type=int,
+        default=None,
+        help="Max nesting depth for subagents (0=disabled, default: 1, env MAX_SUBAGENT_DEPTH, yaml limits.max_subagent_depth)",
+    )
+
+    parser.add_argument(
+        "--max-subagent-rounds",
+        type=int,
+        default=None,
+        help="Max tool-call rounds per subagent (default: 5, env MAX_SUBAGENT_ROUNDS, yaml limits.max_subagent_rounds)",
     )
 
     parser.add_argument(
         "--web-search-timeout",
         type=float,
         default=None,
-        help="Timeout in seconds for web_search tool (env WEB_SEARCH_TIMEOUT, yaml timeouts.web_search)"
+        help="Timeout in seconds for web_search tool (env WEB_SEARCH_TIMEOUT, yaml timeouts.web_search)",
     )
 
     parser.add_argument(
         "--ollama-timeout",
         type=float,
         default=None,
-        help="Timeout in seconds for non-stream Ollama calls (env OLLAMA_TIMEOUT, yaml timeouts.ollama)"
+        help="Timeout in seconds for non-stream Ollama calls (env OLLAMA_TIMEOUT, yaml timeouts.ollama)",
     )
 
     parser.add_argument(
         "--ollama-first-token-timeout",
         type=float,
         default=None,
-        help="Timeout in seconds waiting for first token (env OLLAMA_FIRST_TOKEN_TIMEOUT, yaml timeouts.ollama_first_token)"
+        help="Timeout in seconds waiting for first token (env OLLAMA_FIRST_TOKEN_TIMEOUT, yaml timeouts.ollama_first_token)",
     )
 
     parser.add_argument(
         "--ollama-stream-idle-timeout",
         type=float,
         default=None,
-        help="Timeout in seconds for stalled streams (env OLLAMA_STREAM_IDLE_TIMEOUT, yaml timeouts.ollama_stream_idle)"
+        help="Timeout in seconds for stalled streams (env OLLAMA_STREAM_IDLE_TIMEOUT, yaml timeouts.ollama_stream_idle)",
+    )
+
+    parser.add_argument(
+        "--think",
+        type=str,
+        default=None,
+        choices=["auto", "true", "false"],
+        help="Control the 'think' parameter for Ollama chat calls. 'auto' lets LFM2 models default to False, others default to not setting it. 'true' forces think=True, 'false' forces think=False (env THINK, yaml think)",
     )
 
     spinner_group = parser.add_mutually_exclusive_group()
     spinner_group.add_argument(
         "--spinner",
         action="store_true",
-        help="Enable terminal spinner indicators (env SPINNER_ENABLED, yaml ui.spinner)"
+        help="Enable terminal spinner indicators (env SPINNER_ENABLED, yaml ui.spinner)",
     )
     spinner_group.add_argument(
-        "--no-spinner",
-        action="store_true",
-        help="Disable terminal spinner indicators"
+        "--no-spinner", action="store_true", help="Disable terminal spinner indicators"
     )
 
     parser.add_argument(
@@ -1060,70 +1454,69 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         default=None,
         choices=["line", "dots"],
-        help="Spinner style: line or dots (env SPINNER_STYLE, yaml ui.spinner_style)"
+        help="Spinner style: line or dots (env SPINNER_STYLE, yaml ui.spinner_style)",
     )
 
     parser.add_argument(
         "--spinner-interval",
         type=float,
         default=None,
-        help="Spinner frame interval seconds (env SPINNER_INTERVAL, yaml ui.spinner_interval)"
+        help="Spinner frame interval seconds (env SPINNER_INTERVAL, yaml ui.spinner_interval)",
     )
 
     parser.add_argument(
         "--spinner-stall-delay",
         type=float,
         default=None,
-        help="Seconds of no tokens before showing spinner (env SPINNER_STALL_DELAY, yaml ui.spinner_stall_delay)"
+        help="Seconds of no tokens before showing spinner (env SPINNER_STALL_DELAY, yaml ui.spinner_stall_delay)",
     )
 
     parser.add_argument(
         "--retry-max-attempts",
         type=int,
         default=_parse_env_int("RETRY_MAX_ATTEMPTS", 3),
-        help="Max retry attempts for Ollama calls (default: 3 or env RETRY_MAX_ATTEMPTS)"
+        help="Max retry attempts for Ollama calls (default: 3 or env RETRY_MAX_ATTEMPTS)",
     )
 
     parser.add_argument(
         "--retry-initial-delay",
         type=float,
         default=_parse_env_float("RETRY_INITIAL_DELAY", 0.5),
-        help="Initial backoff delay in seconds (default: 0.5 or env RETRY_INITIAL_DELAY)"
+        help="Initial backoff delay in seconds (default: 0.5 or env RETRY_INITIAL_DELAY)",
     )
 
     parser.add_argument(
         "--retry-max-delay",
         type=float,
         default=_parse_env_float("RETRY_MAX_DELAY", 8.0),
-        help="Max backoff delay in seconds (default: 8.0 or env RETRY_MAX_DELAY)"
+        help="Max backoff delay in seconds (default: 8.0 or env RETRY_MAX_DELAY)",
     )
 
     parser.add_argument(
         "--retry-multiplier",
         type=float,
         default=_parse_env_float("RETRY_MULTIPLIER", 2.0),
-        help="Backoff multiplier (default: 2.0 or env RETRY_MULTIPLIER)"
+        help="Backoff multiplier (default: 2.0 or env RETRY_MULTIPLIER)",
     )
 
     parser.add_argument(
         "--retry-jitter",
         type=float,
         default=_parse_env_float("RETRY_JITTER", 0.1),
-        help="Jitter ratio applied to backoff delay (default: 0.1 or env RETRY_JITTER)"
+        help="Jitter ratio applied to backoff delay (default: 0.1 or env RETRY_JITTER)",
     )
 
     return parser.parse_args()
+
 
 def log_to_file(file_handle: TextIO, text: str) -> None:
     """Writes text to file and forces a flush to ensure it's saved immediately."""
     file_handle.write(text)
     file_handle.flush()
 
+
 def render_stream_text(
-    text: str,
-    file_handle: TextIO,
-    flush_interval: int = 20,
-    delay: float = 0.0
+    text: str, file_handle: TextIO, flush_interval: int = 20, delay: float = 0.0
 ) -> None:
     """Render text progressively to stdout while logging to file."""
     if not text:
@@ -1138,33 +1531,40 @@ def render_stream_text(
     file_handle.write(text)
     file_handle.flush()
 
+
 def perform_web_search(query: str) -> str:
     """
     Performs a simple web search using DuckDuckGo and returns a context string.
     """
     if not HAS_DDG:
         return "[System Error: duckduckgo-search library not installed, cannot search web.]"
-    
+
     print(f"\n[Searching web for: '{query}'...]")
     try:
         results = list(DDGS().text(query, max_results=3))
         if not results:
             return "No web results found."
-        
+
         context_parts = ["Web Search Results:"]
         for res in results:
-            title = res.get('title', 'No Title')
-            body = res.get('body', 'No Content')
-            href = res.get('href', '')
+            title = res.get("title", "No Title")
+            body = res.get("body", "No Content")
+            href = res.get("href", "")
             context_parts.append(f"- Source: {title} ({href})\n  Content: {body}")
-        
+
         return "\n\n".join(context_parts)
     except Exception as e:
         return f"[Web Search Error: {str(e)}]"
 
 
-def read_file(file_path: str, max_lines: int = 1000, start_line: int = 1) -> str:
-    """Read a text file with optional line limits."""
+def read_file(
+    file_path: str,
+    max_lines: int = 200,
+    start_line: int = 1,
+    max_bytes: int = 512_000,
+    max_content: int = 64_000,
+) -> str:
+    """Read a text file with optional line limits and size cap."""
     path = Path(file_path)
     if not file_path:
         return "[Error: file_path is required]"
@@ -1172,41 +1572,67 @@ def read_file(file_path: str, max_lines: int = 1000, start_line: int = 1) -> str
         return f"[Error: File not found: {file_path}]"
     if not path.is_file():
         return f"[Error: Path is not a file: {file_path}]"
-    
+
+    # Reject files over max_bytes to avoid timeouts
+    try:
+        size = path.stat().st_size
+        if size > max_bytes:
+            return f"[Error: File too large ({size:,} bytes, limit {max_bytes:,}). Use start_line/max_lines to read in chunks.]"
+    except OSError:
+        pass
+
     print(f"\n[Reading file: {file_path}]")
     try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
-        
+
         start_idx = max(0, start_line - 1)
         if max_lines > 0:
             end_idx = start_idx + max_lines
             selected_lines = lines[start_idx:end_idx]
         else:
             selected_lines = lines[start_idx:]
-        
-        content = ''.join(selected_lines)
+
+        content = "".join(selected_lines)
         total_lines = len(lines)
         shown_lines = len(selected_lines)
-        
+
+        # Truncate if content still exceeds max_content after line slicing
+        if len(content) > max_content:
+            content = (
+                content[:max_content]
+                + f"\n\n... [truncated, {total_lines} total lines]"
+            )
+            shown_lines = content.count("\n")
+
         return f"[File: {file_path} (showing {shown_lines} of {total_lines} lines)]\n\n{content}"
     except Exception as e:
         return f"[Error reading file: {str(e)}]"
+
+
+def _decode_escapes(s: str) -> str:
+    if "\\" not in s:
+        return s
+    s = s.replace("\\n", "\n")
+    s = s.replace("\\t", "\t")
+    s = s.replace("\\r", "\r")
+    return s
 
 
 def write_file(file_path: str, content: str, create_dirs: bool = True) -> str:
     """Write content to a file, creating directories if needed."""
     if not file_path:
         return "[Error: file_path is required]"
-    
+
+    content = _decode_escapes(content)
     path = Path(file_path)
     try:
         if create_dirs:
             path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(path, 'w', encoding='utf-8') as f:
+
+        with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-        
+
         return f"[File written: {path}] ({len(content)} bytes)"
     except Exception as e:
         return f"[Error writing file: {str(e)}]"
@@ -1216,63 +1642,72 @@ def append_file(file_path: str, content: str, add_newline: bool = True) -> str:
     """Append content to a file."""
     if not file_path:
         return "[Error: file_path is required]"
-    
+
+    content = _decode_escapes(content)
     path = Path(file_path)
     try:
         if path.exists():
-            with open(path, 'rb') as f:
+            with open(path, "rb") as f:
                 f.seek(0, 2)
                 if f.tell() > 0:
                     f.seek(-1, 2)
                     last_char = f.read(1)
-                    needs_newline = add_newline and last_char != b'\n'
+                    needs_newline = add_newline and last_char != b"\n"
                 else:
                     needs_newline = False
         else:
             needs_newline = False
-        
-        with open(path, 'a', encoding='utf-8') as f:
+
+        with open(path, "a", encoding="utf-8") as f:
             if needs_newline:
-                f.write('\n')
+                f.write("\n")
             f.write(content)
-        
+
         return f"[Content appended to: {path}] ({len(content)} bytes)"
     except Exception as e:
         return f"[Error appending to file: {str(e)}]"
 
 
-def list_directory(directory_path: str, pattern: str = "*", recursive: bool = False) -> str:
+def list_directory(
+    directory_path: str, pattern: str = "*", recursive: bool = False
+) -> str:
     """List files and directories in a path."""
     if not directory_path:
         return "[Error: directory_path is required]"
-    
+
     path = Path(directory_path)
     if not path.exists():
         return f"[Error: Directory not found: {directory_path}]"
     if not path.is_dir():
         return f"[Error: Path is not a directory: {directory_path}]"
-    
+
     print(f"\n[Listing directory: {directory_path}]")
     try:
         if recursive:
             items = list(path.rglob(pattern))
         else:
             items = list(path.glob(pattern))
-        
+
         items.sort(key=lambda x: (not x.is_dir(), x.name))
-        
+
         if not items:
             return f"[Directory is empty: {directory_path}]"
-        
+
         lines = [f"[Directory: {directory_path}]"]
         for item in items:
             if item.is_dir():
                 lines.append(f"📁 {item.name}/")
             else:
                 size = item.stat().st_size
-                size_str = f"{size:,} B" if size < 1024 else f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/1024/1024:.1f} MB"
+                size_str = (
+                    f"{size:,} B"
+                    if size < 1024
+                    else f"{size / 1024:.1f} KB"
+                    if size < 1024 * 1024
+                    else f"{size / 1024 / 1024:.1f} MB"
+                )
                 lines.append(f"📄 {item.name} ({size_str})")
-        
+
         return "\n".join(lines)
     except Exception as e:
         return f"[Error listing directory: {str(e)}]"
@@ -1282,7 +1717,7 @@ def run_shell(command: str, timeout: int = 30, workdir: Optional[str] = None) ->
     """Run a shell command and return its stdout, stderr, and exit code."""
     if not command:
         return "[Error: command is required]"
-    
+
     print(f"\n[Running: {command}]")
     try:
         result = subprocess.run(
@@ -1313,7 +1748,7 @@ def read_json_file(
     file_path: str,
     max_entries: int = 100,
     query_filter: str = "",
-    return_summary: bool = False
+    return_summary: bool = False,
 ) -> str:
     """
     Read a JSON file efficiently with streaming support.
@@ -1332,15 +1767,21 @@ def read_json_file(
     try:
         is_ndjson = _detect_ndjson(path)
         if is_ndjson:
-            return _read_ndjson_streaming(path, max_entries, query_filter, return_summary)
-        return _read_regular_json_streaming(path, max_entries, query_filter, return_summary)
+            return _read_ndjson_streaming(
+                path, max_entries, query_filter, return_summary
+            )
+        return _read_regular_json_streaming(
+            path, max_entries, query_filter, return_summary
+        )
     except json.JSONDecodeError as e:
         return f"[Error: Invalid JSON - {str(e)}]"
     except Exception as e:
         return f"[Error reading file: {str(e)}]"
 
 
-def _resolve_output_path(file_path: str, output_dir: Optional[str]) -> Tuple[Optional[Path], Optional[str]]:
+def _resolve_output_path(
+    file_path: str, output_dir: Optional[str]
+) -> Tuple[Optional[Path], Optional[str]]:
     if not file_path:
         return None, "[Error: file_path is required]"
 
@@ -1362,7 +1803,9 @@ def _resolve_output_path(file_path: str, output_dir: Optional[str]) -> Tuple[Opt
     return target_path, None
 
 
-def write_output_file(file_path: str, content: str, output_dir: Optional[str] = None) -> str:
+def write_output_file(
+    file_path: str, content: str, output_dir: Optional[str] = None
+) -> str:
     target_path, error = _resolve_output_path(file_path, output_dir)
     if error:
         return error
@@ -1395,10 +1838,7 @@ def _detect_ndjson(path: Path) -> bool:
 
 
 def _read_ndjson_streaming(
-    path: Path,
-    max_entries: int,
-    query_filter: str,
-    return_summary: bool
+    path: Path, max_entries: int, query_filter: str, return_summary: bool
 ) -> str:
     results: List[Any] = []
     count = 0
@@ -1427,7 +1867,7 @@ def _read_ndjson_streaming(
             "format": "ndjson",
             "entries_read": count,
             "sample_structure": _get_structure(results[0]) if results else None,
-            "file_path": str(path)
+            "file_path": str(path),
         }
         return json.dumps(summary, indent=2)
 
@@ -1435,10 +1875,7 @@ def _read_ndjson_streaming(
 
 
 def _read_regular_json_streaming(
-    path: Path,
-    max_entries: int,
-    query_filter: str,
-    return_summary: bool
+    path: Path, max_entries: int, query_filter: str, return_summary: bool
 ) -> str:
     file_size = path.stat().st_size
     print(f"  File size: {file_size / 1024 / 1024:.2f} MB")
@@ -1467,7 +1904,7 @@ def _read_regular_json_streaming(
                 "total_entries": len(data),
                 "entries_returned": len(entries),
                 "sample_structure": _get_structure(data[0]) if data else None,
-                "file_path": str(path)
+                "file_path": str(path),
             }
             return json.dumps(summary, indent=2)
 
@@ -1478,7 +1915,7 @@ def _read_regular_json_streaming(
             "format": "json",
             "type": "object",
             "structure": _get_structure(data),
-            "file_path": str(path)
+            "file_path": str(path),
         }
         return json.dumps(summary, indent=2)
 
@@ -1526,19 +1963,17 @@ def _get_structure(data: Any, max_depth: int = 3) -> Dict[str, Any]:
     if max_depth <= 0:
         return {"type": type(data).__name__}
     if isinstance(data, dict):
-        return {
-            k: _get_structure(v, max_depth - 1)
-            for k, v in list(data.items())[:10]
-        }
+        return {k: _get_structure(v, max_depth - 1) for k, v in list(data.items())[:10]}
     if isinstance(data, list):
         if data:
             return {
                 "type": "array",
                 "length": len(data),
-                "item_structure": _get_structure(data[0], max_depth - 1)
+                "item_structure": _get_structure(data[0], max_depth - 1),
             }
         return {"type": "array", "length": 0}
     return {"type": type(data).__name__}
+
 
 def load_context_files(context_path: str, extensions: List[str]) -> str:
     """
@@ -1548,112 +1983,120 @@ def load_context_files(context_path: str, extensions: List[str]) -> str:
     """
     if not context_path or not os.path.exists(context_path):
         return ""
-    
+
     context_parts = []
-    
+
     # Normalize extensions (remove dots if present)
-    extensions = [ext.lstrip('.').lower() for ext in extensions]
-    
+    extensions = [ext.lstrip(".").lower() for ext in extensions]
+
     if os.path.isfile(context_path):
         # Single file
         try:
-            with open(context_path, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(context_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
                 context_parts.append(f"=== File: {context_path} ===\n{content}\n")
         except Exception as e:
             context_parts.append(f"=== Error reading {context_path}: {e} ===\n")
-    
+
     elif os.path.isdir(context_path):
         # Directory - recursively find files with matching extensions
         for root, dirs, files in os.walk(context_path):
             for file in files:
-                file_ext = file.split('.')[-1].lower() if '.' in file else ''
-                if file_ext in extensions or '*' in extensions:
+                file_ext = file.split(".")[-1].lower() if "." in file else ""
+                if file_ext in extensions or "*" in extensions:
                     file_path = os.path.join(root, file)
                     try:
-                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        with open(
+                            file_path, "r", encoding="utf-8", errors="ignore"
+                        ) as f:
                             content = f.read()
                             rel_path = os.path.relpath(file_path, context_path)
-                            context_parts.append(f"=== File: {rel_path} ===\n{content}\n")
+                            context_parts.append(
+                                f"=== File: {rel_path} ===\n{content}\n"
+                            )
                     except Exception as e:
-                        context_parts.append(f"=== Error reading {file_path}: {e} ===\n")
-    
+                        context_parts.append(
+                            f"=== Error reading {file_path}: {e} ===\n"
+                        )
+
     return "\n".join(context_parts)
 
 
 def load_context_from_database(
-    db_manager, 
+    db_manager,
     additional_paths: Optional[List[str]] = None,
     limit: Optional[int] = None,
-    extensions: Optional[List[str]] = None
+    extensions: Optional[List[str]] = None,
 ) -> str:
     """
     Load context from database and optionally from additional file paths.
-    
+
     Args:
         db_manager: Database manager instance
         additional_paths: Additional file/directory paths to load context from
         limit: Maximum number of conversations to load from database
-        
+
     Returns:
         Concatenated context from database and files
     """
     context_parts = []
-    
+
     # Load from database
     try:
         conversations = db_manager.get_all_conversations(limit=limit)
         if conversations:
             context_parts.append("=== Database Conversations ===\n")
             for conv in conversations:
-                context_parts.append(f"--- Conversation {conv.id} (Model: {conv.model}, Created: {conv.created_at}) ---\n")
+                context_parts.append(
+                    f"--- Conversation {conv.id} (Model: {conv.model}, Created: {conv.created_at}) ---\n"
+                )
                 for msg in conv.messages:
-                    if msg.get('role') in ['user', 'assistant']:
-                        role = msg.get('role', 'unknown').upper()
-                        content = msg.get('content', '')
+                    if msg.get("role") in ["user", "assistant"]:
+                        role = msg.get("role", "unknown").upper()
+                        content = msg.get("content", "")
                         context_parts.append(f"{role}: {content}\n")
                 context_parts.append("\n")
     except Exception as e:
         context_parts.append(f"=== Error loading from database: {e} ===\n")
-    
+
     # Load from additional paths
     if additional_paths:
-        load_extensions = extensions or ['txt', 'log']
+        load_extensions = extensions or ["txt", "log"]
         for path in additional_paths:
-            if path and path != 'db':
+            if path and path != "db":
                 content = load_context_files(path, load_extensions)
                 if content:
                     context_parts.append(f"=== File Context: {path} ===\n{content}\n")
-    
+
     return "\n".join(context_parts)
 
 
 def parse_context_arg(context_arg: str) -> Dict[str, Any]:
     """
     Parse the --context argument to extract database and file paths.
-    
+
     Args:
         context_arg: The context argument value
-        
+
     Returns:
         Dictionary with 'use_db' boolean and 'paths' list of additional paths
     """
     if not context_arg:
-        return {'use_db': False, 'paths': []}
-    
+        return {"use_db": False, "paths": []}
+
     # Split by comma to handle multiple sources
-    parts = [part.strip() for part in context_arg.split(',')]
-    
+    parts = [part.strip() for part in context_arg.split(",")]
+
     use_db = False
     paths = []
-    
+
     for part in parts:
-        if part.lower() == 'db':
+        if part.lower() == "db":
             use_db = True
         elif part:
             paths.append(part)
-    
-    return {'use_db': use_db, 'paths': paths}
+
+    return {"use_db": use_db, "paths": paths}
 
 
 def _get_retry_config_from_args(args: argparse.Namespace) -> RetryConfig:
@@ -1671,11 +2114,7 @@ def _apply_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
     yaml_data = _load_yaml_config(config_path)
 
     args.tool_timeout = _resolve_float(
-        args.tool_timeout,
-        "TOOL_TIMEOUT",
-        yaml_data,
-        ("timeouts", "tool"),
-        30.0
+        args.tool_timeout, "TOOL_TIMEOUT", yaml_data, ("timeouts", "tool"), 30.0
     )
 
     args.web_search_timeout = _resolve_float(
@@ -1683,15 +2122,11 @@ def _apply_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "WEB_SEARCH_TIMEOUT",
         yaml_data,
         ("timeouts", "web_search"),
-        args.tool_timeout
+        args.tool_timeout,
     )
 
     args.ollama_timeout = _resolve_float(
-        args.ollama_timeout,
-        "OLLAMA_TIMEOUT",
-        yaml_data,
-        ("timeouts", "ollama"),
-        60.0
+        args.ollama_timeout, "OLLAMA_TIMEOUT", yaml_data, ("timeouts", "ollama"), 60.0
     )
 
     args.ollama_first_token_timeout = _resolve_float(
@@ -1699,7 +2134,7 @@ def _apply_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "OLLAMA_FIRST_TOKEN_TIMEOUT",
         yaml_data,
         ("timeouts", "ollama_first_token"),
-        20.0
+        20.0,
     )
 
     args.ollama_stream_idle_timeout = _resolve_float(
@@ -1707,8 +2142,72 @@ def _apply_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "OLLAMA_STREAM_IDLE_TIMEOUT",
         yaml_data,
         ("timeouts", "ollama_stream_idle"),
-        15.0
+        15.0,
     )
+
+    args.read_file_max_bytes = _resolve_int(
+        args.read_file_max_bytes,
+        "READ_FILE_MAX_BYTES",
+        yaml_data,
+        ("limits", "read_file_max_bytes"),
+        512000,
+    )
+
+    args.read_file_max_lines = _resolve_int(
+        args.read_file_max_lines,
+        "READ_FILE_MAX_LINES",
+        yaml_data,
+        ("limits", "read_file_max_lines"),
+        200,
+    )
+
+    args.read_file_max_content = _resolve_int(
+        args.read_file_max_content,
+        "READ_FILE_MAX_CONTENT",
+        yaml_data,
+        ("limits", "read_file_max_content"),
+        64000,
+    )
+
+    args.max_subagent_depth = _resolve_int(
+        args.max_subagent_depth,
+        "MAX_SUBAGENT_DEPTH",
+        yaml_data,
+        ("limits", "max_subagent_depth"),
+        1,
+    )
+
+    args.max_subagent_rounds = _resolve_int(
+        args.max_subagent_rounds,
+        "MAX_SUBAGENT_ROUNDS",
+        yaml_data,
+        ("limits", "max_subagent_rounds"),
+        5,
+    )
+
+    # Resolve think setting: auto/explicit
+    if args.think is None:
+        think_env = os.environ.get("THINK", "").lower()
+        if think_env in ("true", "1", "yes", "on"):
+            args.think = "true"
+        elif think_env in ("false", "0", "no", "off"):
+            args.think = "false"
+        elif think_env == "auto":
+            args.think = "auto"
+        else:
+            think_yaml = _yaml_get(yaml_data, "think")
+            if think_yaml is not None:
+                yaml_val = str(think_yaml).lower()
+                if yaml_val in ("true", "1", "yes", "on"):
+                    args.think = "true"
+                elif yaml_val in ("false", "0", "no", "off"):
+                    args.think = "false"
+                elif yaml_val == "auto":
+                    args.think = "auto"
+                else:
+                    args.think = "auto"
+            else:
+                args.think = "auto"
 
     args.spinner_enabled = _resolve_bool(
         args.spinner,
@@ -1716,15 +2215,11 @@ def _apply_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "SPINNER_ENABLED",
         yaml_data,
         ("ui", "spinner"),
-        True
+        True,
     )
 
     args.spinner_style = _resolve_str(
-        args.spinner_style,
-        "SPINNER_STYLE",
-        yaml_data,
-        ("ui", "spinner_style"),
-        "line"
+        args.spinner_style, "SPINNER_STYLE", yaml_data, ("ui", "spinner_style"), "line"
     )
 
     args.spinner_interval = _resolve_float(
@@ -1732,7 +2227,7 @@ def _apply_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "SPINNER_INTERVAL",
         yaml_data,
         ("ui", "spinner_interval"),
-        0.1
+        0.1,
     )
 
     args.spinner_stall_delay = _resolve_float(
@@ -1740,13 +2235,15 @@ def _apply_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "SPINNER_STALL_DELAY",
         yaml_data,
         ("ui", "spinner_stall_delay"),
-        1.5
+        1.5,
     )
 
     return yaml_data
 
 
-def _get_model_specific_timeout(model: str, base_timeout: Optional[float]) -> Optional[float]:
+def _get_model_specific_timeout(
+    model: str, base_timeout: Optional[float]
+) -> Optional[float]:
     """Get adjusted timeout for models that need more time for tool selection."""
     if base_timeout is not None:
         return base_timeout
@@ -1760,31 +2257,49 @@ def _supports_lfm2_tool_format(model: str) -> bool:
     return model.lower().startswith("lfm2")
 
 
+def get_think_kwargs(model: str, think_setting: str) -> Dict[str, Any]:
+    """Return kwargs dict for ollama.chat() based on the think setting.
+    
+    think_setting: 'auto' (LFM2→False, others→no kwargs),
+                   'true' (always think=True),
+                   'false' (always think=False)
+    """
+    if think_setting == "true":
+        return {"think": True}
+    elif think_setting == "false":
+        return {"think": False}
+    else:  # auto
+        if _supports_lfm2_tool_format(model):
+            return {"think": False}
+        return {}
+
+
 def _format_tools_for_lfm2(tools: List[Dict[str, Any]]) -> str:
     """Format tools as JSON string for LFM2.5 system prompt."""
     simplified_tools = []
     for tool in tools:
         if tool.get("type") == "function":
             func = tool.get("function", {})
-            simplified_tools.append({
-                "name": func.get("name", ""),
-                "description": func.get("description", ""),
-                "parameters": func.get("parameters", {})
-            })
+            simplified_tools.append(
+                {
+                    "name": func.get("name", ""),
+                    "description": func.get("description", ""),
+                    "parameters": func.get("parameters", {}),
+                }
+            )
     return json.dumps(simplified_tools, indent=2)
 
 
 def _prepare_messages_for_lfm2(
-    messages: List[Dict[str, str]],
-    tools: List[Dict[str, Any]]
+    messages: List[Dict[str, str]], tools: List[Dict[str, Any]]
 ) -> List[Dict[str, str]]:
     """Prepare messages with tools in system prompt for LFM2.5."""
     tools_json = _format_tools_for_lfm2(tools)
     system_content = f"List of tools: {tools_json}"
-    
+
     # Check if there's already a system message
     has_system = any(msg.get("role") == "system" for msg in messages)
-    
+
     if has_system:
         # Append tools to existing system message
         new_messages = []
@@ -1805,12 +2320,12 @@ def _run_chat_turn(
     messages: List[Dict[str, str]],
     args: argparse.Namespace,
     file_handle: TextIO,
-    retry_config: RetryConfig
+    retry_config: RetryConfig,
 ) -> str:
     if args.experimental_websearch and HAS_DDG:
         ollama_timeout = _get_model_specific_timeout(model, args.ollama_timeout)
-        tools = get_tools()
-        
+        tools = get_tools(max_subagent_depth=args.max_subagent_depth)
+
         return chat_with_tools(
             model=model,
             messages=messages,
@@ -1827,7 +2342,13 @@ def _run_chat_turn(
             spinner_enabled=args.spinner_enabled,
             spinner_style=args.spinner_style,
             spinner_interval=args.spinner_interval,
-            spinner_stall_delay=args.spinner_stall_delay
+            spinner_stall_delay=args.spinner_stall_delay,
+            read_file_max_bytes=args.read_file_max_bytes,
+            read_file_max_lines=args.read_file_max_lines,
+            read_file_max_content=args.read_file_max_content,
+            max_subagent_depth=args.max_subagent_depth,
+            max_subagent_rounds=args.max_subagent_rounds,
+            think_setting=args.think,
         )
 
     print(f"{model}: ", end="", flush=True)
@@ -1843,11 +2364,11 @@ def _run_chat_turn(
         spinner_enabled=args.spinner_enabled,
         spinner_style=args.spinner_style,
         spinner_interval=args.spinner_interval,
-        spinner_stall_delay=args.spinner_stall_delay
+        spinner_stall_delay=args.spinner_stall_delay,
     )
 
     for chunk in stream:
-        part = chunk['message']['content']
+        part = chunk["message"]["content"]
         render_stream_text(part, file_handle, delay=args.render_delay)
         full_response += part
 
@@ -1859,7 +2380,7 @@ def _respond_with_fallbacks(
     messages: List[Dict[str, str]],
     args: argparse.Namespace,
     file_handle: TextIO,
-    retry_config: RetryConfig
+    retry_config: RetryConfig,
 ) -> Dict[str, str]:
     last_error: Optional[Exception] = None
     for model in model_candidates:
@@ -1880,6 +2401,7 @@ def _respond_with_fallbacks(
     if last_error:
         raise last_error
     raise RuntimeError("No available models to respond.")
+
 
 def main() -> None:
     args = parse_arguments()
@@ -1905,7 +2427,9 @@ def main() -> None:
             return
         choices = [f"{c.id}: {c.model} ({c.created_at})" for c in sessions]
         if HAS_QUESTIONARY:
-            answer = questionary.select("Select a conversation to continue:", choices=choices).ask()
+            answer = questionary.select(
+                "Select a conversation to continue:", choices=choices
+            ).ask()
         else:
             print("Select a conversation to continue:")
             for i, choice in enumerate(choices, 1):
@@ -1941,16 +2465,28 @@ def main() -> None:
         if conv is None:
             print(f"Conversation {args.export_session} not found.")
             return
-        out_target = sys.stdout if args.output is None else args.output.open("w", encoding="utf-8")
+        out_target = (
+            sys.stdout
+            if args.output is None
+            else args.output.open("w", encoding="utf-8")
+        )
         if args.format == "json":
-            json.dump({
-                "id": conv.id,
-                "model": conv.model,
-                "flags": conv.flags,
-                "messages": conv.messages,
-                "created_at": conv.created_at.isoformat() if conv.created_at else None,
-                "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
-            }, out_target, indent=2)
+            json.dump(
+                {
+                    "id": conv.id,
+                    "model": conv.model,
+                    "flags": conv.flags,
+                    "messages": conv.messages,
+                    "created_at": conv.created_at.isoformat()
+                    if conv.created_at
+                    else None,
+                    "updated_at": conv.updated_at.isoformat()
+                    if conv.updated_at
+                    else None,
+                },
+                out_target,
+                indent=2,
+            )
         elif args.format == "csv":
             writer = csv.writer(out_target)
             writer.writerow(["role", "content"])
@@ -1993,9 +2529,11 @@ def main() -> None:
     db_manager = None
     if args.persist_to_db:
         if not HAS_DB:
-            print("Error: Database dependencies not installed. Run: pip install psycopg2-binary asyncpg")
+            print(
+                "Error: Database dependencies not installed. Run: pip install psycopg2-binary asyncpg"
+            )
             return
-    
+
     try:
         db_manager = get_database_manager(sync=True)
         # Create tables if they don't exist
@@ -2012,58 +2550,66 @@ def main() -> None:
         messages: List[Dict[str, str]] = _preloaded_messages  # type: ignore
     except NameError:
         messages: List[Dict[str, str]] = []
-    
+
     # Parse context argument
-    context_config = parse_context_arg(args.context)
+    context_config = parse_context_arg(args.context_path)
     use_db_context = context_config.get("use_db", False)
-    
+
     # Load context if provided
     context_content = ""
-    if args.context:
-        if context_config['use_db']:
+    if args.context_path:
+        if context_config["use_db"]:
             # Load from database
             if db_manager is None:
                 print("Error: Cannot load from database without --persist-to-db flag")
                 return
-            
+
             try:
-                extensions = [ext.strip() for ext in args.context_grep.split(',')]
+                extensions = [ext.strip() for ext in args.context_grep.split(",")]
                 context_content = load_context_from_database(
-                    db_manager, 
-                    additional_paths=context_config['paths'],
-                    extensions=extensions
+                    db_manager,
+                    additional_paths=context_config["paths"],
+                    extensions=extensions,
                 )
                 if context_content:
                     # Add context as a system message
-                    messages.append({
-                        "role": "system",
-                        "content": f"You have access to the following context:\n\n{context_content}"
-                    })
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": f"You have access to the following context:\n\n{context_content}",
+                        }
+                    )
                     print(f"[Loaded context from database]")
-                    if context_config['paths']:
-                        print(f"[Also loaded context from: {', '.join(context_config['paths'])}]")
+                    if context_config["paths"]:
+                        print(
+                            f"[Also loaded context from: {', '.join(context_config['paths'])}]"
+                        )
             except Exception as e:
                 print(f"Error loading context from database: {e}")
         else:
             # Load from files only
-            extensions = [ext.strip() for ext in args.context_grep.split(',')]
-            context_content = load_context_files(args.context, extensions)
+            extensions = [ext.strip() for ext in args.context_grep.split(",")]
+            context_content = load_context_files(args.context_path, extensions)
             if context_content:
                 # Add context as a system message
-                messages.append({
-                    "role": "system",
-                    "content": f"You have access to the following context files:\n\n{context_content}"
-                })
-                print(f"[Loaded context from: {args.context}]")
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": f"You have access to the following context files:\n\n{context_content}",
+                    }
+                )
+                print(f"[Loaded context from: {args.context_path}]")
                 print(f"[File extensions: {', '.join(extensions)}]")
-    
+
     print(f"Starting chat with {available_models[0]}.")
     if len(available_models) > 1:
         print(f"Fallback models: {', '.join(available_models[1:])}")
     print(f"Experimental Mode: {'ON' if args.experimental else 'OFF'}")
-    print(f"Intelligent Web Search: {'ON (LLM decides when to search)' if args.experimental_websearch else 'OFF'}")
-    if args.context:
-        print(f"Context: {args.context}")
+    print(
+        f"Intelligent Web Search: {'ON (LLM decides when to search)' if args.experimental_websearch else 'OFF'}"
+    )
+    if args.context_path:
+        print(f"Context: {args.context_path}")
     print(f"Database Persistence: {'ON' if args.persist_to_db else 'OFF'}")
     if use_db_context:
         print("Conversation logging: OFF (context includes 'db')\n")
@@ -2080,18 +2626,18 @@ def main() -> None:
                 # Write session header
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 header = (
-                    f"\n\n{'='*30}\n"
+                    f"\n\n{'=' * 30}\n"
                     f"SESSION START: {timestamp}\n"
                     f"MODEL: {available_models[0]}\n"
                     f"FLAGS: exp={args.experimental}, web={args.experimental_websearch}\n"
                 )
                 if len(available_models) > 1:
                     header += f"FALLBACKS: {', '.join(available_models[1:])}\n"
-                if args.context:
-                    header += f"CONTEXT: {args.context}\n"
+                if args.context_path:
+                    header += f"CONTEXT: {args.context_path}\n"
                 if args.persist_to_db:
                     header += f"DB_PERSIST: true\n"
-                header += f"{'='*30}\n"
+                header += f"{'=' * 30}\n"
                 log_to_file(f, header)
 
             current_model_index = 0
@@ -2104,10 +2650,10 @@ def main() -> None:
                     if user_input.lower() in ["exit", "quit"]:
                         print("Exiting...")
                         break
-                    
+
                     # Store original query for logging
                     original_query = user_input
-                    
+
                     # Add user message to history
                     messages.append({"role": "user", "content": user_input})
                     log_to_file(f, f"\nUser: {original_query}\n")
@@ -2120,7 +2666,7 @@ def main() -> None:
                         messages,
                         args,
                         f,
-                        retry_config
+                        retry_config,
                     )
 
                     full_response = response_info["response"]
@@ -2128,35 +2674,39 @@ def main() -> None:
 
                     if used_model in available_models:
                         current_model_index = available_models.index(used_model)
-                    
+
                     # Add spacing after response
                     print(f"\n{'─' * 50}\n")
-                    
+
                     # Add final newline to file and history
                     log_to_file(f, "\n")
                     messages.append({"role": "assistant", "content": full_response})
-                    
+
                     # Save to database if enabled
                     if args.persist_to_db and db_manager:
                         try:
                             flags = {
-                                'experimental': args.experimental,
-                                'experimental_websearch': args.experimental_websearch,
-                                'model_fallbacks': model_fallbacks,
-                                'context': args.context
+                                "experimental": args.experimental,
+                                "experimental_websearch": args.experimental_websearch,
+                                "model_fallbacks": model_fallbacks,
+                                "context": args.context_path,
                             }
-                            
+
                             if conversation_id is None:
                                 # Save new conversation
                                 conversation_id = db_manager.save_conversation(
                                     model=used_model,
                                     messages=messages.copy(),
-                                    flags=flags
+                                    flags=flags,
                                 )
-                                print(f"[Saved conversation to database with ID: {conversation_id}]")
+                                print(
+                                    f"[Saved conversation to database with ID: {conversation_id}]"
+                                )
                             else:
                                 # Update existing conversation
-                                db_manager.update_conversation(conversation_id, messages.copy())
+                                db_manager.update_conversation(
+                                    conversation_id, messages.copy()
+                                )
                         except Exception as e:
                             print(f"[Warning] Failed to save to database: {e}")
 
@@ -2167,12 +2717,14 @@ def main() -> None:
                     print(f"\nError: {e}")
                     # If it's a connection error, it might be due to Docker host issues
                     if "Connection refused" in str(e):
-                        print("Tip: If running in Docker, ensure OLLAMA_HOST is set correctly to reach your host machine.")
+                        print(
+                            "Tip: If running in Docker, ensure OLLAMA_HOST is set correctly to reach your host machine."
+                        )
                     break
 
     except IOError as e:
         print(f"Error opening log file {args.dest}: {e}")
-    
+
     finally:
         # Close database connection if used
         if db_manager:
@@ -2180,6 +2732,7 @@ def main() -> None:
                 db_manager.close()
             except:
                 pass
+
 
 def entry_point():
     """Entry point for uv run and direct execution."""

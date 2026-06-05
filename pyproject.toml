@@ -19,6 +19,11 @@ dev = [
     "types-requests>=2.0.0",
     "pytest>=8.0.0",
 ]
+build = [
+    "nuitka>=2.0.0",
+    "ordered-set>=4.1.0",
+    "zstandard>=0.22.0",
+]
 
 [project.scripts]
 ollama-chat = "stream_chat:main"

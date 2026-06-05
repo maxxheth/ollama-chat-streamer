@@ -3,3 +3,8 @@ data
 .env
 __pycache__
 .env.swp
+dist
+chat_log.txt
+*.swp
+fib.rs
+fibonacci.go

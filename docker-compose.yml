@@ -1,46 +1,8 @@
 services:
-  chat:
-    build: .
-    volumes:
-      # Mount the current directory so logs are saved to your host machine
-      - ./:/app
-    # Use the host network so the container can reach services on the host
-    # (e.g., the Ollama server running on localhost:11434).
-    network_mode: host
-    environment:
-      # Connect to the Ollama instance that is running on the host.
-      - OLLAMA_HOST=http://localhost:11434
-      # Database configuration (still points to the internal postgres container)
-      - DATABASE_URL=postgresql://postgres:postgres@localhost:5432/chatdb
-      # Configurable flags via Env Vars
-    stdin_open: true
-    tty: true
-    depends_on:
-      - postgres
-
-  core-chat:
-    build:
-      context: .
-      dockerfile: Dockerfile.core
-    volumes:
-      # Mount the current directory so logs are saved to your host machine
-      - ./:/app
-    # Use the host network so the container can reach services on the host
-    # (e.g., the Ollama server running on localhost:11434).
-    network_mode: host
-    environment:
-      # Connect to the Ollama instance that is running on the host.
-      - OLLAMA_HOST=http://localhost:11434
-      # Database configuration (still points to the internal postgres container)
-      - DATABASE_URL=postgresql://postgres:postgres@localhost:5432/chatdb
-      # Configurable flags via Env Vars
-    stdin_open: true
-    tty: true
-    depends_on:
-      - postgres
-
   postgres:
     image: postgres:15-alpine
+    container_name: ollama-chat-db
+    restart: unless-stopped
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
@@ -49,7 +11,11 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
-
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
   postgres_data:
