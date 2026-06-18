@@ -25,6 +25,7 @@ func main() {
 	dbURL := flag.String("db", "", "Database URL")
 	depth := flag.Int("subagent-depth", -1, "Max subagent depth (0 to disable)")
 	rounds := flag.Int("subagent-rounds", -1, "Max subagent rounds")
+	turnLimit := flag.Int("turn-limit", -1, "Max tool-call turns per chat turn (0 = unlimited)")
 	help := flag.Bool("help", false, "Show help")
 
 	flag.Parse()
@@ -34,7 +35,26 @@ func main() {
 		return
 	}
 
-	cfg, err := config.Load(*cfgPath)
+	// Auto-detect config if not explicitly provided
+	resolvedCfgPath := *cfgPath
+	if resolvedCfgPath == "" {
+		resolvedCfgPath = os.Getenv("OLLAMA_CONFIG_PATH")
+	}
+	if resolvedCfgPath == "" {
+		if _, err := os.Stat("ollama-chat.yaml"); err == nil {
+			resolvedCfgPath = "ollama-chat.yaml"
+		}
+	}
+	if resolvedCfgPath == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			path := home + "/.config/ollama-chat/ollama-chat.yaml"
+			if _, err := os.Stat(path); err == nil {
+				resolvedCfgPath = path
+			}
+		}
+	}
+
+	cfg, err := config.Load(resolvedCfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
 		os.Exit(1)
@@ -75,6 +95,9 @@ func main() {
 	}
 	if *rounds >= 0 {
 		cfg.MaxSubagentRounds = *rounds
+	}
+	if *turnLimit >= 0 {
+		cfg.TurnLimit = *turnLimit
 	}
 
 	var database *db.Pool
@@ -122,11 +145,12 @@ Flags:
   -db <url>                Database URL (env: DATABASE_URL)
   -subagent-depth <n>      Max subagent depth (env: MAX_SUBAGENT_DEPTH)
   -subagent-rounds <n>     Max subagent rounds (env: MAX_SUBAGENT_ROUNDS)
+  -turn-limit <n>          Max tool-call turns per chat turn (env: TURN_LIMIT, default: 100)
 
 Environment variables (in order of precedence: flag > env > yaml > default):
   OLLAMA_MODEL, OLLAMA_HOST, OLLAMA_MODEL_FALLBACKS, THINK,
   EXPERIMENTAL_WEBSEARCH, PERSIST_TO_DB, DATABASE_URL,
-  MAX_SUBAGENT_DEPTH, MAX_SUBAGENT_ROUNDS, CONTEXT_PATH
+  MAX_SUBAGENT_DEPTH, MAX_SUBAGENT_ROUNDS, TURN_LIMIT, CONTEXT_PATH
 
 Tools available when websearch is enabled:
   web_search, read_file, write_file, append_file, list_directory,
@@ -145,11 +169,11 @@ Examples:
 	fmt.Fprintf(os.Stderr, "\nConfig file lookup:\n")
 	fmt.Fprintf(os.Stderr, "  1. --config flag\n")
 	fmt.Fprintf(os.Stderr, "  2. OLLAMA_CONFIG_PATH env var\n")
-	fmt.Fprintf(os.Stderr, "  3. ./.opencode.yaml\n")
-	fmt.Fprintf(os.Stderr, "  4. ~/.config/opencode/opencode.yaml\n")
+	fmt.Fprintf(os.Stderr, "  3. ./ollama-chat.yaml\n")
+	fmt.Fprintf(os.Stderr, "  4. ~/.config/ollama-chat/ollama-chat.yaml\n")
 	fmt.Fprintf(os.Stderr, "  5. All defaults\n")
 
-	fmt.Fprintf(os.Stderr, "\nExample .opencode.yaml:\n")
+	fmt.Fprintf(os.Stderr, "\nExample ollama-chat.yaml:\n")
 	fmt.Fprintf(os.Stderr, `  model: llama3.2:latest
   ollama_host: http://localhost:11434
   experimental_websearch: true
