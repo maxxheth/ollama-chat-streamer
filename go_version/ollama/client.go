@@ -34,9 +34,9 @@ type Tool struct {
 }
 
 type ToolFunction struct {
-	Name        string                   `json:"name"`
-	Description string                   `json:"description"`
-	Parameters  map[string]interface{}   `json:"parameters"`
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Parameters  map[string]interface{} `json:"parameters"`
 }
 
 type Options struct {
@@ -52,12 +52,12 @@ type ChatRequest struct {
 }
 
 type ChatResponse struct {
-	Model      string   `json:"model"`
-	CreatedAt  string   `json:"created_at"`
-	Message    Message  `json:"message"`
-	Done       bool     `json:"done"`
-	DoneReason string   `json:"done_reason,omitempty"`
-	Error      string   `json:"error,omitempty"`
+	Model      string  `json:"model"`
+	CreatedAt  string  `json:"created_at"`
+	Message    Message `json:"message"`
+	Done       bool    `json:"done"`
+	DoneReason string  `json:"done_reason,omitempty"`
+	Error      string  `json:"error,omitempty"`
 }
 
 type Client struct {
@@ -71,6 +71,10 @@ type ModelInfo struct {
 }
 
 func NewClient(host string) *Client {
+	// Normalize host URL: add scheme if missing
+	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+		host = "http://" + host
+	}
 	return &Client{
 		host:   strings.TrimRight(host, "/"),
 		client: &http.Client{Timeout: 0},

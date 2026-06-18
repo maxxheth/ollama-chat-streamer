@@ -75,8 +75,7 @@ func (cl *ChatLoop) Run(ctx context.Context) error {
 	if cl.cfg.AutoCompact {
 		info, err := cl.client.ShowModel(ctx, cl.cfg.Model)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not fetch model info: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Auto-compact disabled for this session.\n")
+			fmt.Fprintf(os.Stderr, "Warning: could not fetch model info — auto-compact disabled\n")
 		} else {
 			cl.modelInfo = info
 		}

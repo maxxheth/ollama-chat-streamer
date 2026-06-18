@@ -105,7 +105,7 @@ func main() {
 		var err error
 		database, err = db.Connect(context.Background(), cfg.DatabaseURL)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Database connection failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Database not available (%s)\n", cfg.DatabaseURL)
 			fmt.Fprintf(os.Stderr, "Continuing without persistence.\n")
 			database = nil
 		}
