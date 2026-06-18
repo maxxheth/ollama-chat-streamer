@@ -5,6 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/maxx/ollama-chat-streamer/go_version/chat"
 	"github.com/maxx/ollama-chat-streamer/go_version/config"
@@ -106,8 +110,28 @@ func main() {
 		database, err = db.Connect(context.Background(), cfg.DatabaseURL)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Database not available (%s)\n", cfg.DatabaseURL)
-			fmt.Fprintf(os.Stderr, "Continuing without persistence.\n")
-			database = nil
+			fmt.Fprintf(os.Stderr, "Attempting to start Postgres via docker-compose…\n")
+
+			if startPostgresViaCompose() {
+				fmt.Fprintf(os.Stderr, "Postgres started, retrying connection…\n")
+
+				// Retry with backoff — Postgres may need a few seconds to initialize
+				for i := 0; i < 6; i++ {
+					time.Sleep(2 * time.Second)
+					database, err = db.Connect(context.Background(), cfg.DatabaseURL)
+					if err == nil {
+						break
+					}
+					if i < 5 {
+						fmt.Fprintf(os.Stderr, "  Not ready yet, waiting…\n")
+					}
+				}
+			}
+
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Continuing without persistence.\n")
+				database = nil
+			}
 		}
 		if database != nil {
 			defer database.Close()
@@ -121,6 +145,61 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+// startPostgresViaCompose looks for docker-compose.yml in the config directory
+// and attempts to start the postgres service. Returns true if the command
+// was launched successfully (does not guarantee the DB is ready).
+func startPostgresViaCompose() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+
+	composeFile := filepath.Join(home, ".config", "ollama-chat", "docker-compose.yml")
+	if _, err := os.Stat(composeFile); err != nil {
+		fmt.Fprintf(os.Stderr, "  Compose file not found at %s\n", composeFile)
+		return false
+	}
+
+	if _, err := exec.LookPath("docker"); err != nil {
+		fmt.Fprintf(os.Stderr, "  Docker is not installed\n")
+		return false
+	}
+
+	// Determine which docker compose command is available
+	composeCmd := ""
+	if cmd, err := exec.LookPath("docker-compose"); err == nil {
+		composeCmd = cmd
+	} else {
+		// Check for docker compose plugin
+		if err := exec.Command("docker", "compose", "version").Run(); err == nil {
+			composeCmd = "docker compose"
+		}
+	}
+
+	if composeCmd == "" {
+		fmt.Fprintf(os.Stderr, "  Neither 'docker compose' nor 'docker-compose' found\n")
+		return false
+	}
+
+	fmt.Fprintf(os.Stderr, "  Running: %s -f %s up -d postgres\n", composeCmd, composeFile)
+
+	var cmd *exec.Cmd
+	if composeCmd == "docker compose" {
+		cmd = exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "postgres")
+	} else {
+		cmd = exec.Command(composeCmd, "-f", composeFile, "up", "-d", "postgres")
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Failed to start Postgres: %s\n", strings.TrimSpace(string(output)))
+		return false
+	}
+
+	fmt.Fprintf(os.Stderr, "  %s", strings.TrimSpace(string(output)))
+	return true
 }
 
 func printHelp() {
@@ -183,7 +262,7 @@ Examples:
 `)
 
 	fmt.Fprintf(os.Stderr, "\nDatabase (PostgreSQL):\n")
-	fmt.Fprintf(os.Stderr, "  Use go_version/run.sh to auto-start Postgres via Docker\n")
+	fmt.Fprintf(os.Stderr, "  Auto-started via ~/.config/ollama-chat/docker-compose.yml\n")
 	fmt.Fprintf(os.Stderr, "  Default: postgres://postgres:postgres@localhost:5434/chatdb\n")
 	fmt.Fprintf(os.Stderr, "  Schema: conversations + messages tables auto-created\n")
 }
