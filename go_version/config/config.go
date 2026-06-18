@@ -10,23 +10,26 @@ import (
 )
 
 type Config struct {
-	Model              string `yaml:"model"`
-	ModelFallbacks     string `yaml:"model_fallbacks"`
-	OllamaHost         string `yaml:"ollama_host"`
-	ContextPath        string `yaml:"context_path"`
-	SystemPrompt       string `yaml:"system_prompt"`
-	ExperimentalWebSearch bool `yaml:"experimental_websearch"`
-	PersistToDB        bool   `yaml:"persist_to_db"`
-	DatabaseURL        string `yaml:"database_url"`
-	MaxSubagentDepth   int    `yaml:"max_subagent_depth"`
-	MaxSubagentRounds  int    `yaml:"max_subagent_rounds"`
-	Think              string `yaml:"think"`
-	ReadFileMaxLines   int    `yaml:"read_file_max_lines"`
-	ReadFileMaxBytes   int64  `yaml:"read_file_max_bytes"`
-	ReadFileMaxSize    int64  `yaml:"read_file_max_size"`
-	ModelTimeout       int    `yaml:"model_timeout"`
-	InstallPrefix      string `yaml:"install_prefix"`
-	Compiled           bool   `yaml:"compiled"`
+	Model                 string `yaml:"model"`
+	ModelFallbacks        string `yaml:"model_fallbacks"`
+	OllamaHost            string `yaml:"ollama_host"`
+	ContextPath           string `yaml:"context_path"`
+	SystemPrompt          string `yaml:"system_prompt"`
+	ExperimentalWebSearch bool   `yaml:"experimental_websearch"`
+	PersistToDB           bool   `yaml:"persist_to_db"`
+	DatabaseURL           string `yaml:"database_url"`
+	MaxSubagentDepth      int    `yaml:"max_subagent_depth"`
+	MaxSubagentRounds     int    `yaml:"max_subagent_rounds"`
+	Think                 string `yaml:"think"`
+	ReadFileMaxLines      int    `yaml:"read_file_max_lines"`
+	ReadFileMaxBytes      int64  `yaml:"read_file_max_bytes"`
+	ReadFileMaxSize       int64  `yaml:"read_file_max_size"`
+	ModelTimeout          int    `yaml:"model_timeout"`
+	TurnLimit             int    `yaml:"turn_limit"`
+	InstallPrefix         string `yaml:"install_prefix"`
+	Compiled              bool   `yaml:"compiled"`
+	AutoCompact           bool   `yaml:"auto_compact"`
+	AutoCompactLimit      int    `yaml:"auto_compact_limit"`
 }
 
 func Default() *Config {
@@ -42,6 +45,9 @@ func Default() *Config {
 		ReadFileMaxBytes:      65536,
 		ReadFileMaxSize:       524288,
 		ModelTimeout:          120,
+		TurnLimit:             100,
+		AutoCompact:           true,
+		AutoCompactLimit:      80,
 	}
 }
 
@@ -115,6 +121,19 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("MODEL_TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.ModelTimeout = n
+		}
+	}
+	if v := os.Getenv("TURN_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.TurnLimit = n
+		}
+	}
+	if v := os.Getenv("AUTO_COMPACT"); v != "" {
+		c.AutoCompact = v == "true"
+	}
+	if v := os.Getenv("AUTO_COMPACT_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 100 {
+			c.AutoCompactLimit = n
 		}
 	}
 }

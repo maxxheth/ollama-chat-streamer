@@ -61,8 +61,13 @@ type ChatResponse struct {
 }
 
 type Client struct {
-	host    string
-	client  *http.Client
+	host   string
+	client *http.Client
+}
+
+// ModelInfo holds the subset of /api/show we care about.
+type ModelInfo struct {
+	ContextLength int
 }
 
 func NewClient(host string) *Client {
@@ -70,6 +75,50 @@ func NewClient(host string) *Client {
 		host:   strings.TrimRight(host, "/"),
 		client: &http.Client{Timeout: 0},
 	}
+}
+
+// ShowModel fetches model info from /api/show and extracts the context length.
+// The context_length field name varies by architecture (e.g. llama.context_length,
+// qwen35moe.context_length), so we scan all keys ending in ".context_length".
+func (c *Client) ShowModel(ctx context.Context, model string) (*ModelInfo, error) {
+	body, err := json.Marshal(map[string]string{"name": model})
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.host+"/api/show", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var raw map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+
+	info := &ModelInfo{}
+	if mi, ok := raw["model_info"].(map[string]interface{}); ok {
+		for key, val := range mi {
+			if strings.HasSuffix(key, ".context_length") {
+				if n, ok := val.(float64); ok {
+					info.ContextLength = int(n)
+					break
+				}
+			}
+		}
+	}
+
+	if info.ContextLength == 0 {
+		return nil, fmt.Errorf("model %s: could not determine context length", model)
+	}
+	return info, nil
 }
 
 func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
