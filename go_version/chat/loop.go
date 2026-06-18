@@ -273,7 +273,8 @@ func (cl *ChatLoop) processTurn(
 	}
 
 	for _, tc := range assistantMsg.ToolCalls {
-		toolCtx, toolCancel := context.WithTimeout(ctx, 60*time.Second)
+		toolTimeout := time.Duration(cl.cfg.ModelTimeoutDuration()) * time.Second
+		toolCtx, toolCancel := context.WithTimeout(ctx, toolTimeout)
 
 		var result string
 		var toolErr error
