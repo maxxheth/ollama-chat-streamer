@@ -106,32 +106,27 @@ func main() {
 
 	var database *db.Pool
 	if cfg.PersistToDB && cfg.DatabaseURL != "" {
+		// Proactively start Postgres before attempting to connect
+		startPostgresViaCompose(cfg.DatabaseURL)
+
 		var err error
-		database, err = db.Connect(context.Background(), cfg.DatabaseURL)
+		for i := 0; i < 16; i++ {
+			database, err = db.Connect(context.Background(), cfg.DatabaseURL)
+			if err == nil {
+				break
+			}
+			if i == 0 {
+				fmt.Fprintf(os.Stderr, "Database not available (%s)\n", cfg.DatabaseURL)
+				fmt.Fprintf(os.Stderr, "Waiting for Postgres to become ready...\n")
+			} else if i < 15 {
+				fmt.Fprintf(os.Stderr, "  Not ready yet, waiting...\n")
+			}
+			time.Sleep(2 * time.Second)
+		}
+
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Database not available (%s)\n", cfg.DatabaseURL)
-			fmt.Fprintf(os.Stderr, "Attempting to start Postgres via docker-compose…\n")
-
-			if startPostgresViaCompose() {
-				fmt.Fprintf(os.Stderr, "Postgres started, retrying connection…\n")
-
-				// Retry with backoff — Postgres may need a few seconds to initialize
-				for i := 0; i < 6; i++ {
-					time.Sleep(2 * time.Second)
-					database, err = db.Connect(context.Background(), cfg.DatabaseURL)
-					if err == nil {
-						break
-					}
-					if i < 5 {
-						fmt.Fprintf(os.Stderr, "  Not ready yet, waiting…\n")
-					}
-				}
-			}
-
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Continuing without persistence.\n")
-				database = nil
-			}
+			fmt.Fprintf(os.Stderr, "Continuing without persistence.\n")
+			database = nil
 		}
 		if database != nil {
 			defer database.Close()
@@ -148,9 +143,9 @@ func main() {
 }
 
 // startPostgresViaCompose looks for docker-compose.yml in the config directory
-// and attempts to start the postgres service. Returns true if the command
-// was launched successfully (does not guarantee the DB is ready).
-func startPostgresViaCompose() bool {
+// and attempts to start the postgres service, passing POSTGRES_PORT to match
+// the database URL so the port mapping is always consistent.
+func startPostgresViaCompose(databaseURL string) bool {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
@@ -166,6 +161,9 @@ func startPostgresViaCompose() bool {
 		fmt.Fprintf(os.Stderr, "  Docker is not installed\n")
 		return false
 	}
+
+	// Extract port from database URL so docker-compose port matches
+	postgresPort := extractPort(databaseURL)
 
 	// Determine which docker compose command is available
 	composeCmd := ""
@@ -183,7 +181,7 @@ func startPostgresViaCompose() bool {
 		return false
 	}
 
-	fmt.Fprintf(os.Stderr, "  Running: %s -f %s up -d postgres\n", composeCmd, composeFile)
+	fmt.Fprintf(os.Stderr, "  Running: %s -f %s up -d postgres (port %s)\n", composeCmd, composeFile, postgresPort)
 
 	var cmd *exec.Cmd
 	if composeCmd == "docker compose" {
@@ -191,6 +189,7 @@ func startPostgresViaCompose() bool {
 	} else {
 		cmd = exec.Command(composeCmd, "-f", composeFile, "up", "-d", "postgres")
 	}
+	cmd.Env = append(os.Environ(), "POSTGRES_PORT="+postgresPort)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -200,6 +199,39 @@ func startPostgresViaCompose() bool {
 
 	fmt.Fprintf(os.Stderr, "  %s", strings.TrimSpace(string(output)))
 	return true
+}
+
+// extractPort parses the port from a postgres:// URL.
+// Returns "5432" if the URL has no explicit port or can't be parsed.
+func extractPort(databaseURL string) string {
+	// Strip postgres:// or postgresql:// prefix
+	s := databaseURL
+	for _, prefix := range []string{"postgresql://", "postgres://"} {
+		if strings.HasPrefix(s, prefix) {
+			s = strings.TrimPrefix(s, prefix)
+			break
+		}
+	}
+
+	// Find the port: after the last colon before the first slash
+	// Format: user:pass@host:port/dbname
+	if atIdx := strings.LastIndex(s, "@"); atIdx >= 0 {
+		s = s[atIdx+1:]
+	}
+	if colonIdx := strings.LastIndex(s, ":"); colonIdx >= 0 {
+		slashIdx := strings.Index(s, "/")
+		if slashIdx < 0 {
+			slashIdx = len(s)
+		}
+		if colonIdx < slashIdx {
+			portStr := s[colonIdx+1 : slashIdx]
+			if portStr != "" {
+				return portStr
+			}
+		}
+	}
+
+	return "5432"
 }
 
 func printHelp() {
@@ -263,7 +295,7 @@ Examples:
 
 	fmt.Fprintf(os.Stderr, "\nDatabase (PostgreSQL):\n")
 	fmt.Fprintf(os.Stderr, "  Auto-started via ~/.config/ollama-chat/docker-compose.yml\n")
-	fmt.Fprintf(os.Stderr, "  Default: postgres://postgres:postgres@localhost:5434/chatdb\n")
+	fmt.Fprintf(os.Stderr, "  Default: postgres://postgres:postgres@localhost:5432/chatdb\n")
 	fmt.Fprintf(os.Stderr, "  Schema: conversations + messages tables auto-created\n")
 }
 
