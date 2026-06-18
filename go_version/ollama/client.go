@@ -358,6 +358,7 @@ func BuildSystemPrompt(hasTools bool, hasSpawnAgent bool) string {
 		"- Use web_search for current events, facts you're unsure about, and any information that may have changed since your training",
 		"- Use read_file to read file contents, write_file to create or overwrite files",
 		"- Use run_shell to execute commands or run scripts",
+		"- Use graphify to build a knowledge graph whenever you need to examine, analyze, or understand a codebase — always prefer graphify over manually reading individual files",
 	}
 	if hasSpawnAgent {
 		parts = append(parts, "- Use spawn_agent to delegate complex multi-step tasks to a sub-agent, such as: code reviews across many files, multi-file refactoring, iterative research with multiple searches, or any task requiring more than 2-3 sequential tool calls")
