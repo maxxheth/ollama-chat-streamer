@@ -21,10 +21,6 @@ var graphifyTool = Tool{
 				"type":        "string",
 				"description": "Path to the directory or file to analyze",
 			},
-			"output": map[string]interface{}{
-				"type":        "string",
-				"description": "Custom output directory (default: graphify-out/ relative to the analyzed path)",
-			},
 		},
 		"required": []string{"path"},
 	},
@@ -46,24 +42,20 @@ func graphifyExecute(ctx context.Context, args map[string]interface{}) (string, 
 		return "", fmt.Errorf("path does not exist: %s", absPath)
 	}
 
-	output := GetString(args, "output")
-	if output == "" {
-		output = filepath.Join(absPath, "graphify-out")
-	} else if !filepath.IsAbs(output) {
-		output = filepath.Join(absPath, output)
-	}
+	// Output is always at <path>/graphify-out/
+	output := filepath.Join(absPath, "graphify-out")
 
 	// Ensure graphify CLI is available
 	if err := ensureGraphify(ctx); err != nil {
 		return "", fmt.Errorf("graphify setup: %w", err)
 	}
 
-	// Run graphify with a generous timeout for large codebases
+	// Run graphify extract with a generous timeout for large codebases
 	runCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(runCtx, "graphify", absPath, "--output", output)
+	cmd := exec.CommandContext(runCtx, "graphify", "extract", absPath)
 	cmd.Stderr = &stderr
 
 	outputBytes, err := cmd.Output()
