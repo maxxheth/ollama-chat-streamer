@@ -24,8 +24,8 @@ type ToolCall struct {
 }
 
 type ToolCallFunction struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
 }
 
 type Tool struct {
