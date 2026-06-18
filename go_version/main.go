@@ -265,7 +265,7 @@ Environment variables (in order of precedence: flag > env > yaml > default):
 
 Tools available when websearch is enabled:
   web_search, read_file, write_file, append_file, list_directory,
-  run_shell, read_json_file, spawn_agent
+  run_shell, read_json_file, spawn_agent, graphify
 
 Sub-agents:
   spawn_agent delegates complex tasks to sub-agents with their own

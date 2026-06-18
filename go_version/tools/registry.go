@@ -67,6 +67,7 @@ func init() {
 		readJSONFileTool,
 		webSearchTool,
 		spawnAgentTool,
+		graphifyTool,
 	}
 }
 
