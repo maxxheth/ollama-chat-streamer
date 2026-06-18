@@ -2,7 +2,6 @@ package subagent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -25,13 +24,13 @@ Work step by step:
 Do NOT ask the user for help — you have all the tools you need.`
 
 type SubagentConfig struct {
-	Model          string
-	OllamaHost     string
-	Think          string
-	MaxRounds      int
-	CurrentDepth   int
-	MaxDepth       int
-	ToolSchemas    []map[string]interface{}
+	Model        string
+	OllamaHost   string
+	Think        string
+	MaxRounds    int
+	CurrentDepth int
+	MaxDepth     int
+	ToolSchemas  []map[string]interface{}
 }
 
 func RunSubagent(ctx context.Context, task string, history []ollama.Message, cfg SubagentConfig) (string, error) {
@@ -94,9 +93,9 @@ func RunSubagent(ctx context.Context, task string, history []ollama.Message, cfg
 
 		for _, tc := range collectedMsg.ToolCalls {
 			start := time.Now()
-			fmt.Fprintf(os.Stderr, "  subagent: %s(%s)\n", tc.Function.Name, truncateArgs(tc.Function.Arguments))
+			fmt.Fprintf(os.Stderr, "  subagent: %s(%s)\n", tc.Function.Name, truncateArgs(string(tc.Function.Arguments)))
 
-			result, err := tools.ExecuteToolCall(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			result, err := tools.ExecuteToolCall(ctx, tc.Function.Name, tc.Function.Arguments)
 			resultStr := result
 			if err != nil {
 				resultStr = fmt.Sprintf("Error: %v", err)
