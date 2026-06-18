@@ -1,0 +1,12 @@
+# ollama-chat configuration
+# Generated from environment variables
+
+model: qwen3.6:35b
+model_fallbacks: cogito-2.1:671b-cloud,glm-4.7:cloud,minimax-m2:cloud,deepseek-v3.2:cloud
+ollama_host: http://localhost:11434
+experimental_websearch: true
+persist_to_db: true
+think: true
+auto_compact: true
+auto_compact_limit: 80
+database_url: postgresql://postgres:postgres@localhost:5432/chatdb

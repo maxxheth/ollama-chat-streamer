@@ -30,7 +30,7 @@ fi
 : "${POSTGRES_PORT:=5434}"
 : "${GO_BUILD_FLAGS:=}"
 
-: "${OLLAMA_MODEL:=llama3.2:latest}"
+: "${OLLAMA_MODEL:=qwen3.6:35b}"
 : "${OLLAMA_HOST:=http://localhost:11434}"
 : "${EXPERIMENTAL_WEBSEARCH:=true}"
 : "${PERSIST_TO_DB:=true}"
