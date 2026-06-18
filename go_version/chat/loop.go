@@ -20,21 +20,23 @@ import (
 )
 
 type ChatLoop struct {
-	cfg     *config.Config
-	client  *ollama.Client
-	db      *db.Pool
-	messages []ollama.Message
-	mu      sync.Mutex
-	scanner *bufio.Scanner
+	cfg                   *config.Config
+	client                *ollama.Client
+	db                    *db.Pool
+	currentConversationID *int // Tracks the active conversation ID
+	messages              []ollama.Message
+	mu                    sync.Mutex
+	scanner               *bufio.Scanner
+	modelInfo             *ollama.ModelInfo // cached model context length
 }
 
 func New(cfg *config.Config, database *db.Pool) *ChatLoop {
 	return &ChatLoop{
-		cfg:     cfg,
-		client:  ollama.NewClient(cfg.OllamaHost),
-		db:      database,
+		cfg:      cfg,
+		client:   ollama.NewClient(cfg.OllamaHost),
+		db:       database,
 		messages: []ollama.Message{},
-		scanner: bufio.NewScanner(os.Stdin),
+		scanner:  bufio.NewScanner(os.Stdin),
 	}
 }
 
@@ -56,39 +58,48 @@ func (cl *ChatLoop) Run(ctx context.Context) error {
 		}
 	}
 
+	// Initial DB State Setup
 	if cl.cfg.PersistToDB && cl.db != nil {
-		if err := cl.migrateMessagesFromDB(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not load previous messages: %v\n", err)
+		// Try to find the most recent conversation to resume or create new one later
+		sessions, err := cl.db.ListSessions(ctx)
+		if err == nil && len(sessions) > 0 {
+			latestID := sessions[0].ID
+			cl.currentConversationID = &latestID
+			fmt.Fprintf(os.Stderr, "Resuming latest session: %d\n", latestID)
+		} else {
+			fmt.Fprintln(os.Stderr, "No previous sessions found. Will create new upon first message.")
 		}
 	}
 
-	var conversationID *int
-	if cl.cfg.PersistToDB && cl.db != nil {
-		id, err := cl.db.SaveConversation(ctx, cl.cfg.Model, nil)
+	// Fetch model context length for auto-compact
+	if cl.cfg.AutoCompact {
+		info, err := cl.client.ShowModel(ctx, cl.cfg.Model)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not create conversation: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Warning: could not fetch model info: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Auto-compact disabled for this session.\n")
+		} else {
+			cl.modelInfo = info
 		}
-		conversationID = id
 	}
 
-	fmt.Fprintf(os.Stderr, "Model: %s | DB: %v | WebSearch: %v | Subagent depth: %d\n",
+	fmt.Fprintf(os.Stderr, "Model: %s | DB: %v | WebSearch: %v | Subagent depth: %d",
 		cl.cfg.Model, cl.cfg.PersistToDB, cl.cfg.ExperimentalWebSearch, cl.cfg.MaxSubagentDepth)
-	fmt.Fprintf(os.Stderr, "Type /help for commands\n\n")
+	if cl.modelInfo != nil {
+		fmt.Fprintf(os.Stderr, " | Compact: %d%%", cl.cfg.AutoCompactLimit)
+	}
+	fmt.Fprintln(os.Stderr)
+	if cl.currentConversationID != nil {
+		fmt.Fprintf(os.Stderr, "Current Session ID: %d\n", *cl.currentConversationID)
+	} else {
+		fmt.Fprintln(os.Stderr, "Current Session ID: (none - will create on first message)")
+	}
+	fmt.Fprint(os.Stderr, "Type /help for commands\n\n")
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-		}
-
-		if cl.cfg.PersistToDB && cl.db != nil && conversationID != nil {
-			cl.db.UpdateConversation(ctx, *conversationID, map[string]interface{}{
-				"model": cl.cfg.Model,
-				"websearch": cl.cfg.ExperimentalWebSearch,
-				"subagent_depth": cl.cfg.MaxSubagentDepth,
-				"messages": len(cl.messages),
-			})
 		}
 
 		prompt, err := cl.readInput()
@@ -100,14 +111,27 @@ func (cl *ChatLoop) Run(ctx context.Context) error {
 		}
 
 		if strings.HasPrefix(prompt, "/") {
-			if err := cl.handleCommand(ctx, prompt, conversationID); err != nil {
+			if err := cl.handleCommand(ctx, prompt); err != nil {
 				fmt.Fprintf(os.Stderr, "Command error: %v\n", err)
 			}
 			continue
 		}
 
-		if cl.cfg.PersistToDB && cl.db != nil && conversationID != nil {
-			cl.db.SaveMessage(ctx, *conversationID, "user", prompt)
+		// Ensure conversation exists if it doesn't (first message of fresh session)
+		if cl.cfg.PersistToDB && cl.db != nil {
+			if cl.currentConversationID == nil {
+				id, err := cl.db.SaveConversation(ctx, cl.cfg.Model, nil)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not create conversation: %v\n", err)
+				} else {
+					cl.currentConversationID = id
+					fmt.Fprintf(os.Stderr, "Created new session ID: %d\n", *id)
+				}
+			}
+
+			if cl.currentConversationID != nil {
+				cl.db.SaveMessage(ctx, *cl.currentConversationID, "user", prompt)
+			}
 		}
 
 		cl.messages = append(cl.messages, ollama.Message{
@@ -126,6 +150,9 @@ func (cl *ChatLoop) Run(ctx context.Context) error {
 				return ctx.Err()
 			}
 		}
+
+		// Auto-compact if approaching context limit
+		cl.compactIfNeeded(ctx)
 	}
 }
 
@@ -159,108 +186,140 @@ func (cl *ChatLoop) chatTurn(ctx context.Context, messages []ollama.Message) err
 		})
 	}
 
-	turnLimit := 20
-	var done bool
-	var err error
-	for turn := 0; turn < turnLimit; turn++ {
-		func() {
-			timeout := time.Duration(cl.cfg.ModelTimeoutDuration()) * time.Second
-			turnCtx, turnCancel := context.WithTimeout(ctx, timeout)
-			defer turnCancel()
-
-			req := ollama.ChatRequest{
-				Model:    cl.cfg.Model,
-				Messages: chatMessages,
-				Stream:   true,
-			}
-			if len(ollamaTools) > 0 {
-				req.Tools = ollamaTools
-			}
-			if val, ok := thinkKwargs["think"]; ok {
-				req.Options = &ollama.Options{Think: &val}
-			}
-
-			stream, err := cl.client.ChatStream(turnCtx, req)
-			if err != nil {
-				err = fmt.Errorf("chat: %w", err)
-				return
-			}
-
-			var assistantMsg ollama.Message
-			assistantMsg.Role = "assistant"
-			fmt.Fprint(os.Stderr, "\n")
-
-			for chunk := range stream {
-				if chunk.Error != "" {
-					fmt.Fprintf(os.Stderr, "\nError: %s\n", chunk.Error)
-					err = fmt.Errorf("ollama: %s", chunk.Error)
-					return
-				}
-				if chunk.Message.Content != "" {
-					fmt.Fprint(os.Stdout, chunk.Message.Content)
-					assistantMsg.Content += chunk.Message.Content
-				}
-				if len(chunk.Message.ToolCalls) > 0 {
-					assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, chunk.Message.ToolCalls...)
-				}
-			}
-			fmt.Fprint(os.Stdout, "\n")
-
-			chatMessages = append(chatMessages, assistantMsg)
-			cl.mu.Lock()
-			cl.messages = append(cl.messages, assistantMsg)
-			cl.mu.Unlock()
-
-			if len(assistantMsg.ToolCalls) == 0 {
-				done = true
-				return
-			}
-
-			for _, tc := range assistantMsg.ToolCalls {
-				toolCtx, toolCancel := context.WithTimeout(ctx, 60*time.Second)
-
-				var result string
-				var toolErr error
-
-				fmt.Fprintf(os.Stderr, "  🛠  %s(%s)\n", tc.Function.Name, truncateArgs(tc.Function.Arguments))
-
-				if tc.Function.Name == "spawn_agent" && cl.cfg.MaxSubagentDepth > 0 {
-					result, toolErr = cl.runSubAgent(toolCtx, tc.Function.Arguments, messages)
-				} else {
-					result, toolErr = tools.ExecuteToolCall(toolCtx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
-				}
-
-				toolCancel()
-
-				if toolErr != nil {
-					result = fmt.Sprintf("Error: %v", toolErr)
-				}
-				toolResultPreview := result
-				if len(toolResultPreview) > 120 {
-					toolResultPreview = toolResultPreview[:120] + "…"
-				}
-				fmt.Fprintf(os.Stderr, "  ✓ %s → %s\n", tc.Function.Name, strings.ReplaceAll(toolResultPreview, "\n", " "))
-
-				toolMsg := ollama.Message{
-					Role:    "tool",
-					Content: result,
-				}
-				chatMessages = append(chatMessages, toolMsg)
-				cl.mu.Lock()
-				cl.messages = append(cl.messages, toolMsg)
-				cl.mu.Unlock()
-			}
-		}()
-
-		if done {
-			return nil
+	turnLimit := cl.cfg.TurnLimit
+	if turnLimit <= 0 {
+		turnLimit = 100
+	}
+	for i := 0; i < turnLimit; i++ {
+		result := cl.processTurn(ctx, chatMessages, ollamaTools, thinkKwargs, messages)
+		if result.err != nil {
+			return result.err
 		}
-		if err != nil {
-			return err
+		chatMessages = result.messages
+		if result.done {
+			return nil
 		}
 	}
 
 	return fmt.Errorf("tool call loop exceeded %d turns", turnLimit)
+}
+
+type turnResult struct {
+	done     bool
+	err      error
+	messages []ollama.Message // updated chat history
+}
+
+func (cl *ChatLoop) processTurn(
+	ctx context.Context,
+	chatMessages []ollama.Message,
+	ollamaTools []ollama.Tool,
+	thinkKwargs map[string]bool,
+	originalMessages []ollama.Message,
+) turnResult {
+	timeout := time.Duration(cl.cfg.ModelTimeoutDuration()) * time.Second
+	turnCtx, turnCancel := context.WithTimeout(ctx, timeout)
+	defer turnCancel()
+
+	req := ollama.ChatRequest{
+		Model:    cl.cfg.Model,
+		Messages: chatMessages,
+		Stream:   true,
+	}
+	if len(ollamaTools) > 0 {
+		req.Tools = ollamaTools
+	}
+	if val, ok := thinkKwargs["think"]; ok {
+		req.Options = &ollama.Options{Think: &val}
+	}
+
+	stream, streamErr := cl.client.ChatStream(turnCtx, req)
+	if streamErr != nil {
+		return turnResult{err: fmt.Errorf("chat: %w", streamErr)}
+	}
+
+	var assistantMsg ollama.Message
+	assistantMsg.Role = "assistant"
+	fmt.Fprint(os.Stderr, "\n")
+
+	for chunk := range stream {
+		if chunk.Error != "" {
+			fmt.Fprintf(os.Stderr, "\nError: %s\n", chunk.Error)
+			return turnResult{err: fmt.Errorf("ollama: %s", chunk.Error)}
+		}
+		if chunk.Message.Content != "" {
+			fmt.Fprint(os.Stdout, chunk.Message.Content)
+			assistantMsg.Content += chunk.Message.Content
+		}
+		if len(chunk.Message.ToolCalls) > 0 {
+			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, chunk.Message.ToolCalls...)
+		}
+	}
+	fmt.Fprint(os.Stdout, "\n")
+
+	chatMessages = append(chatMessages, assistantMsg)
+	cl.mu.Lock()
+	cl.messages = append(cl.messages, assistantMsg)
+
+	// Persist Assistant Message if DB is enabled and we have a conversation ID
+	if cl.cfg.PersistToDB && cl.db != nil && cl.currentConversationID != nil {
+		go func(id int, msg ollama.Message) {
+			if err := cl.db.SaveMessage(context.Background(), id, "assistant", msg.Content); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to save assistant message: %v\n", err)
+			}
+		}(*cl.currentConversationID, assistantMsg)
+	}
+	cl.mu.Unlock()
+
+	if len(assistantMsg.ToolCalls) == 0 {
+		return turnResult{done: true, messages: chatMessages}
+	}
+
+	for _, tc := range assistantMsg.ToolCalls {
+		toolCtx, toolCancel := context.WithTimeout(ctx, 60*time.Second)
+
+		var result string
+		var toolErr error
+
+		fmt.Fprintf(os.Stderr, "  🛠  %s(%s)\n", tc.Function.Name, truncateArgs(string(tc.Function.Arguments)))
+
+		if tc.Function.Name == "spawn_agent" && cl.cfg.MaxSubagentDepth > 0 {
+			result, toolErr = cl.runSubAgent(toolCtx, string(tc.Function.Arguments), originalMessages)
+		} else {
+			result, toolErr = tools.ExecuteToolCall(toolCtx, tc.Function.Name, tc.Function.Arguments)
+		}
+
+		toolCancel()
+
+		if toolErr != nil {
+			result = fmt.Sprintf("Error: %v", toolErr)
+		}
+		toolResultPreview := result
+		if len(toolResultPreview) > 120 {
+			toolResultPreview = toolResultPreview[:120] + "…"
+		}
+		fmt.Fprintf(os.Stderr, "  ✓ %s → %s\n", tc.Function.Name, strings.ReplaceAll(toolResultPreview, "\n", " "))
+
+		toolMsg := ollama.Message{
+			Role:    "tool",
+			Content: result,
+		}
+		chatMessages = append(chatMessages, toolMsg)
+		cl.mu.Lock()
+		cl.messages = append(cl.messages, toolMsg)
+
+		// Persist Tool Message if DB is enabled
+		if cl.cfg.PersistToDB && cl.db != nil && cl.currentConversationID != nil {
+			go func(id int, msg ollama.Message) {
+				if err := cl.db.SaveMessage(context.Background(), id, "tool", msg.Content); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to save tool message: %v\n", err)
+				}
+			}(*cl.currentConversationID, toolMsg)
+		}
+		cl.mu.Unlock()
+	}
+
+	return turnResult{messages: chatMessages}
 }
 
 func (cl *ChatLoop) runSubAgent(ctx context.Context, argsRaw string, history []ollama.Message) (string, error) {
@@ -310,32 +369,8 @@ func (cl *ChatLoop) loadContextFile(path string) error {
 	return nil
 }
 
-func (cl *ChatLoop) migrateMessagesFromDB(ctx context.Context) error {
-	sessions, err := cl.db.ListSessions(ctx)
-	if err != nil {
-		return err
-	}
-	if len(sessions) == 0 {
-		return nil
-	}
-
-	latest := sessions[0]
-	msgs, err := cl.db.ExportSession(ctx, latest.ID)
-	if err != nil {
-		return err
-	}
-
-	for _, m := range msgs {
-		cl.messages = append(cl.messages, ollama.Message{
-			Role:    m.Role,
-			Content: m.Content,
-		})
-	}
-
-	return nil
-}
-
-func (cl *ChatLoop) handleCommand(ctx context.Context, input string, conversationID *int) error {
+// handleCommand processes slash commands.
+func (cl *ChatLoop) handleCommand(ctx context.Context, input string) error {
 	parts := strings.Fields(input)
 	cmd := strings.TrimPrefix(parts[0], "/")
 
@@ -345,7 +380,7 @@ func (cl *ChatLoop) handleCommand(ctx context.Context, input string, conversatio
   /help       Show this help
   /exit       Exit the program
   /clear      Clear message history
-  /save       Save conversation
+  /save       Save conversation (explicit update)
   /export     Export conversation as JSON
   /sessions   List saved sessions
   /load <id>  Load a saved session
@@ -360,13 +395,13 @@ func (cl *ChatLoop) handleCommand(ctx context.Context, input string, conversatio
 		cl.mu.Unlock()
 		fmt.Fprintln(os.Stderr, "Message history cleared.")
 	case "save":
-		if cl.db != nil && conversationID != nil {
-			cl.db.UpdateConversation(ctx, *conversationID, map[string]interface{}{
+		if cl.db != nil && cl.currentConversationID != nil {
+			cl.db.UpdateConversation(ctx, *cl.currentConversationID, map[string]interface{}{
 				"saved_at": time.Now().Format(time.RFC3339),
 			})
-			fmt.Fprintf(os.Stderr, "Conversation %d saved.\n", *conversationID)
+			fmt.Fprintf(os.Stderr, "Conversation %d saved.\n", *cl.currentConversationID)
 		} else {
-			fmt.Fprintln(os.Stderr, "Database not available.")
+			fmt.Fprintln(os.Stderr, "No active conversation to save.")
 		}
 	case "export":
 		cl.mu.Lock()
@@ -394,9 +429,9 @@ func (cl *ChatLoop) handleCommand(ctx context.Context, input string, conversatio
 			if model == "" {
 				model = s.Model
 			}
-			fmt.Fprintf(os.Stderr, "  %d: %s | %s | %s\n", s.ID, model,
+			fmt.Fprintf(os.Stderr, "  %d: %s | %s | Created: %s\n", s.ID, model,
 				s.CreatedAt.Format("2006-01-02 15:04"),
-				s.Flags)
+				s.CreatedAt.Format("2006-01-02"))
 		}
 	case "load":
 		if len(parts) < 2 {
@@ -407,8 +442,36 @@ func (cl *ChatLoop) handleCommand(ctx context.Context, input string, conversatio
 			fmt.Fprintln(os.Stderr, "Database not available.")
 			return nil
 		}
-		// ... would need to implement load logic
-		fmt.Fprintln(os.Stderr, "Load not yet implemented.")
+
+		var sessionID int
+		_, err := fmt.Sscanf(parts[1], "%d", &sessionID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid session ID: %s\n", parts[1])
+			return nil
+		}
+
+		msgs, err := cl.db.ExportSession(ctx, sessionID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading session %d: %v\n", sessionID, err)
+			return nil
+		}
+
+		// Clear current messages and load new ones
+		cl.mu.Lock()
+		cl.messages = make([]ollama.Message, len(msgs))
+		for i, m := range msgs {
+			cl.messages[i] = ollama.Message{
+				Role:    m.Role,
+				Content: m.Content,
+			}
+		}
+		cl.mu.Unlock()
+
+		// Set the active conversation ID so future messages go to this session
+		cl.currentConversationID = &sessionID
+
+		fmt.Fprintf(os.Stderr, "Loaded session %d (%d messages). Messages restored.\n", sessionID, len(msgs))
+
 	case "model":
 		fmt.Fprintf(os.Stderr, "Current model: %s\n", cl.cfg.Model)
 	case "history":
@@ -422,8 +485,41 @@ func (cl *ChatLoop) handleCommand(ctx context.Context, input string, conversatio
 	return nil
 }
 
-func (cl *ChatLoop) ModelTimeoutDuration() int {
-	return cl.cfg.ModelTimeoutDuration()
+// compactIfNeeded checks if the conversation is approaching the model's context
+// limit and compacts it if necessary. Uses the model itself to summarize older
+// messages, keeping recent context intact.
+func (cl *ChatLoop) compactIfNeeded(ctx context.Context) {
+	if cl.modelInfo == nil || !cl.cfg.AutoCompact {
+		return
+	}
+
+	cl.mu.Lock()
+	msgs := make([]ollama.Message, len(cl.messages))
+	copy(msgs, cl.messages)
+	cl.mu.Unlock()
+
+	if !ollama.ShouldCompact(msgs, cl.modelInfo.ContextLength, cl.cfg.AutoCompactLimit) {
+		return
+	}
+
+	estimated := ollama.EstimateTokens(msgs)
+	fmt.Fprintf(os.Stderr, "\n  ⚡ Context: ~%d / %d tokens (%.0f%%) — compacting…\n",
+		estimated, cl.modelInfo.ContextLength,
+		float64(estimated)/float64(cl.modelInfo.ContextLength)*100)
+
+	compacted, err := ollama.CompactMessages(ctx, cl.client, cl.cfg.Model, msgs, 6)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠ Compact failed: %v\n", err)
+		return
+	}
+
+	cl.mu.Lock()
+	cl.messages = compacted
+	cl.mu.Unlock()
+
+	newEstimated := ollama.EstimateTokens(compacted)
+	fmt.Fprintf(os.Stderr, "  ✓ Compacted: %d → %d messages (~%d → ~%d tokens)\n\n",
+		len(msgs), len(compacted), estimated, newEstimated)
 }
 
 func truncateArgs(args string) string {
