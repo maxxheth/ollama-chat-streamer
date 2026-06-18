@@ -216,6 +216,7 @@ if [[ "$SKIP_CONFIG" != "true" ]]; then
     CFG_TURNS="${TURN_LIMIT:-$(read_yaml "turn_limit" "100")}"
     CFG_AUTO_COMPACT="${AUTO_COMPACT:-$(read_yaml "auto_compact" "true")}"
     CFG_AUTO_COMPACT_LIMIT="${AUTO_COMPACT_LIMIT:-$(read_yaml "auto_compact_limit" "80")}"
+    CFG_NUM_CTX="${NUM_CTX:-$(read_yaml "num_ctx" "")}"
     CFG_DB_URL="${DATABASE_URL:-$(read_yaml "database_url" "")}"
     CFG_CONTEXT="${CONTEXT_PATH:-$(read_yaml "context_path" "")}"
 
@@ -239,6 +240,9 @@ install_prefix: ${INSTALL_PREFIX}
 compiled: true
 YAMLEOF
 
+    if [[ -n "$CFG_NUM_CTX" ]]; then
+      echo "num_ctx: ${CFG_NUM_CTX}" >> "$CONFIG_FILE"
+    fi
     if [[ -n "$CFG_DB_URL" ]]; then
       echo "database_url: ${CFG_DB_URL}" >> "$CONFIG_FILE"
     fi

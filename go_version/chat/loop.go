@@ -162,7 +162,7 @@ func (cl *ChatLoop) chatTurn(ctx context.Context, messages []ollama.Message) err
 	toolPrompt := ollama.BuildSystemPrompt(hasTools, hasSpawnAgent)
 	chatMessages := ollama.InsertSystemPrompt(messages, toolPrompt)
 
-	thinkKwargs := cl.cfg.GetThinkKwargs(cl.cfg.Model)
+	opts := cl.cfg.BuildOptions(cl.cfg.Model)
 
 	toolSchemas := tools.GetToolSchemas(hasSpawnAgent)
 	var ollamaTools []ollama.Tool
@@ -190,7 +190,7 @@ func (cl *ChatLoop) chatTurn(ctx context.Context, messages []ollama.Message) err
 		turnLimit = 100
 	}
 	for i := 0; i < turnLimit; i++ {
-		result := cl.processTurn(ctx, chatMessages, ollamaTools, thinkKwargs, messages)
+		result := cl.processTurn(ctx, chatMessages, ollamaTools, opts, messages)
 		if result.err != nil {
 			return result.err
 		}
@@ -213,7 +213,7 @@ func (cl *ChatLoop) processTurn(
 	ctx context.Context,
 	chatMessages []ollama.Message,
 	ollamaTools []ollama.Tool,
-	thinkKwargs map[string]bool,
+	opts *ollama.Options,
 	originalMessages []ollama.Message,
 ) turnResult {
 	timeout := time.Duration(cl.cfg.ModelTimeoutDuration()) * time.Second
@@ -228,9 +228,7 @@ func (cl *ChatLoop) processTurn(
 	if len(ollamaTools) > 0 {
 		req.Tools = ollamaTools
 	}
-	if val, ok := thinkKwargs["think"]; ok {
-		req.Options = &ollama.Options{Think: &val}
-	}
+	req.Options = opts
 
 	stream, streamErr := cl.client.ChatStream(turnCtx, req)
 	if streamErr != nil {
@@ -336,6 +334,7 @@ func (cl *ChatLoop) runSubAgent(ctx context.Context, argsRaw string, history []o
 		Model:        cl.cfg.Model,
 		OllamaHost:   cl.cfg.OllamaHost,
 		Think:        cl.cfg.Think,
+		NumCtx:       cl.cfg.NumCtx,
 		MaxRounds:    cl.cfg.MaxSubagentRounds,
 		CurrentDepth: 0,
 		MaxDepth:     cl.cfg.MaxSubagentDepth - 1,

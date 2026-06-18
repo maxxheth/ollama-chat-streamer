@@ -30,6 +30,7 @@ func main() {
 	depth := flag.Int("subagent-depth", -1, "Max subagent depth (0 to disable)")
 	rounds := flag.Int("subagent-rounds", -1, "Max subagent rounds")
 	turnLimit := flag.Int("turn-limit", -1, "Max tool-call turns per chat turn (0 = unlimited)")
+	numCtx := flag.Int("num-ctx", -1, "Override model context window in tokens (env: NUM_CTX, default: model native)")
 	help := flag.Bool("help", false, "Show help")
 
 	flag.Parse()
@@ -102,6 +103,9 @@ func main() {
 	}
 	if *turnLimit >= 0 {
 		cfg.TurnLimit = *turnLimit
+	}
+	if *numCtx > 0 {
+		cfg.NumCtx = *numCtx
 	}
 
 	var database *db.Pool
@@ -257,11 +261,12 @@ Flags:
   -subagent-depth <n>      Max subagent depth (env: MAX_SUBAGENT_DEPTH)
   -subagent-rounds <n>     Max subagent rounds (env: MAX_SUBAGENT_ROUNDS)
   -turn-limit <n>          Max tool-call turns per chat turn (env: TURN_LIMIT, default: 100)
+  -num-ctx <n>             Override model context window in tokens (env: NUM_CTX, default: model native)
 
 Environment variables (in order of precedence: flag > env > yaml > default):
   OLLAMA_MODEL, OLLAMA_HOST, OLLAMA_MODEL_FALLBACKS, THINK,
   EXPERIMENTAL_WEBSEARCH, PERSIST_TO_DB, DATABASE_URL,
-  MAX_SUBAGENT_DEPTH, MAX_SUBAGENT_ROUNDS, TURN_LIMIT, CONTEXT_PATH
+  MAX_SUBAGENT_DEPTH, MAX_SUBAGENT_ROUNDS, TURN_LIMIT, CONTEXT_PATH, NUM_CTX
 
 Tools available when websearch is enabled:
   web_search, read_file, write_file, append_file, list_directory,

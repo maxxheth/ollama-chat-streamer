@@ -40,7 +40,8 @@ type ToolFunction struct {
 }
 
 type Options struct {
-	Think *bool `json:"think,omitempty"`
+	Think  *bool `json:"think,omitempty"`
+	NumCtx *int  `json:"num_ctx,omitempty"`
 }
 
 type ChatRequest struct {

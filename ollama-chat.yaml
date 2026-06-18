@@ -9,4 +9,5 @@ persist_to_db: true
 think: true
 auto_compact: true
 auto_compact_limit: 80
+num_ctx: 65536
 database_url: postgresql://postgres:postgres@localhost:5432/chatdb

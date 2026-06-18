@@ -27,6 +27,7 @@ type SubagentConfig struct {
 	Model        string
 	OllamaHost   string
 	Think        string
+	NumCtx       int
 	MaxRounds    int
 	CurrentDepth int
 	MaxDepth     int
@@ -50,7 +51,8 @@ func RunSubagent(ctx context.Context, task string, history []ollama.Message, cfg
 		messages = ollama.InsertSystemPrompt(messages, sysPrompt)
 	}
 
-	thinkKwargs := getThinkKwargs(cfg.Model, cfg.Think)
+	// Build options from config (think mode + num_ctx)
+	opts := buildOptions(cfg)
 
 	for round := 0; round < cfg.MaxRounds; round++ {
 		chatTools := convertToolSchemas(subagentTools)
@@ -60,9 +62,7 @@ func RunSubagent(ctx context.Context, task string, history []ollama.Message, cfg
 			Messages: messages,
 			Tools:    chatTools,
 			Stream:   true,
-		}
-		if val, ok := thinkKwargs["think"]; ok {
-			req.Options = &ollama.Options{Think: &val}
+			Options:  opts,
 		}
 
 		var collectedMsg ollama.Message
@@ -185,18 +185,29 @@ func convertToolSchemas(schemas []map[string]interface{}) []ollama.Tool {
 	return tools
 }
 
-func getThinkKwargs(model, setting string) map[string]bool {
-	switch strings.ToLower(setting) {
+func buildOptions(cfg SubagentConfig) *ollama.Options {
+	var opts ollama.Options
+
+	switch strings.ToLower(cfg.Think) {
 	case "true":
-		return map[string]bool{"think": true}
+		v := true
+		opts.Think = &v
 	case "false":
-		return map[string]bool{"think": false}
+		v := false
+		opts.Think = &v
 	default:
-		if strings.HasPrefix(strings.ToLower(model), "lfm2") {
-			return map[string]bool{"think": false}
+		if strings.HasPrefix(strings.ToLower(cfg.Model), "lfm2") {
+			v := false
+			opts.Think = &v
 		}
-		return nil
 	}
+
+	if cfg.NumCtx > 0 {
+		n := cfg.NumCtx
+		opts.NumCtx = &n
+	}
+
+	return &opts
 }
 
 func truncateText(s string, maxLen int) string {

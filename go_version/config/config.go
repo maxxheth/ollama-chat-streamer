@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/maxx/ollama-chat-streamer/go_version/ollama"
 	"gopkg.in/yaml.v3"
 )
 
@@ -30,6 +31,7 @@ type Config struct {
 	Compiled              bool   `yaml:"compiled"`
 	AutoCompact           bool   `yaml:"auto_compact"`
 	AutoCompactLimit      int    `yaml:"auto_compact_limit"`
+	NumCtx                int    `yaml:"num_ctx"`
 }
 
 func Default() *Config {
@@ -136,6 +138,11 @@ func (c *Config) applyEnvOverrides() {
 			c.AutoCompactLimit = n
 		}
 	}
+	if v := os.Getenv("NUM_CTX"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.NumCtx = n
+		}
+	}
 }
 
 func (c *Config) GetThinkKwargs(model string) map[string]bool {
@@ -150,6 +157,33 @@ func (c *Config) GetThinkKwargs(model string) map[string]bool {
 		}
 		return nil
 	}
+}
+
+func (c *Config) BuildOptions(model string) *ollama.Options {
+	var opts ollama.Options
+
+	// Think mode
+	switch strings.ToLower(c.Think) {
+	case "true":
+		v := true
+		opts.Think = &v
+	case "false":
+		v := false
+		opts.Think = &v
+	default:
+		if strings.HasPrefix(strings.ToLower(model), "lfm2") {
+			v := false
+			opts.Think = &v
+		}
+	}
+
+	// Context window override
+	if c.NumCtx > 0 {
+		n := c.NumCtx
+		opts.NumCtx = &n
+	}
+
+	return &opts
 }
 
 func (c *Config) IsLFM2() bool {
