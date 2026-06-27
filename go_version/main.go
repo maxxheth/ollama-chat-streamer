@@ -189,16 +189,25 @@ func startPostgresViaCompose(databaseURL string) bool {
 
 	var cmd *exec.Cmd
 	if composeCmd == "docker compose" {
-		cmd = exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "postgres")
+		cmd = exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "--force-recreate", "postgres")
 	} else {
-		cmd = exec.Command(composeCmd, "-f", composeFile, "up", "-d", "postgres")
+		cmd = exec.Command(composeCmd, "-f", composeFile, "up", "-d", "--force-recreate", "postgres")
 	}
 	cmd.Env = append(os.Environ(), "POSTGRES_PORT="+postgresPort)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  Failed to start Postgres: %s\n", strings.TrimSpace(string(output)))
-		return false
+		// If --force-recreate fails, try removing the container and starting fresh
+		fmt.Fprintf(os.Stderr, "  Recreating container failed, attempting cleanup...\n")
+		if composeCmd == "docker compose" {
+			exec.Command("docker", "compose", "-f", composeFile, "rm", "-f", "postgres").Run()
+			cmd = exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "postgres")
+		} else {
+			exec.Command(composeCmd, "-f", composeFile, "rm", "-f", "postgres").Run()
+			cmd = exec.Command(composeCmd, "-f", composeFile, "up", "-d", "postgres")
+		}
+		cmd.Env = append(os.Environ(), "POSTGRES_PORT="+postgresPort)
+		output, err = cmd.CombinedOutput()
 	}
 
 	fmt.Fprintf(os.Stderr, "  %s", strings.TrimSpace(string(output)))
