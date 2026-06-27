@@ -31,6 +31,9 @@ type Config struct {
 	Compiled              bool   `yaml:"compiled"`
 	AutoCompact           bool   `yaml:"auto_compact"`
 	AutoCompactLimit      int    `yaml:"auto_compact_limit"`
+	AutoCompactTarget     int    `yaml:"auto_compact_target"`
+	AutoCompactKeepRecent int    `yaml:"auto_compact_keep_recent"`
+	ToolResultMaxInline   int    `yaml:"tool_result_max_inline"`
 	NumCtx                int    `yaml:"num_ctx"`
 }
 
@@ -49,7 +52,10 @@ func Default() *Config {
 		ModelTimeout:          120,
 		TurnLimit:             100,
 		AutoCompact:           true,
-		AutoCompactLimit:      80,
+		AutoCompactLimit:      75,
+		AutoCompactTarget:     50,
+		AutoCompactKeepRecent: 8,
+		ToolResultMaxInline:   12000,
 	}
 }
 
@@ -82,6 +88,9 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("CONTEXT_PATH"); v != "" {
 		c.ContextPath = v
+	}
+	if v := os.Getenv("SYSTEM_PROMPT"); v != "" {
+		c.SystemPrompt = v
 	}
 	if v := os.Getenv("EXPERIMENTAL_WEBSEARCH"); v != "" {
 		c.ExperimentalWebSearch = v == "true"
@@ -136,6 +145,21 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("AUTO_COMPACT_LIMIT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 100 {
 			c.AutoCompactLimit = n
+		}
+	}
+	if v := os.Getenv("AUTO_COMPACT_TARGET"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 100 {
+			c.AutoCompactTarget = n
+		}
+	}
+	if v := os.Getenv("AUTO_COMPACT_KEEP_RECENT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.AutoCompactKeepRecent = n
+		}
+	}
+	if v := os.Getenv("TOOL_RESULT_MAX_INLINE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.ToolResultMaxInline = n
 		}
 	}
 	if v := os.Getenv("NUM_CTX"); v != "" {

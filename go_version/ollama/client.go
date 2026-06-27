@@ -373,25 +373,20 @@ func BuildSystemPrompt(hasTools bool, hasSpawnAgent bool) string {
 }
 
 func InsertSystemPrompt(messages []Message, prompt string) []Message {
-	if prompt == "" {
+	if strings.TrimSpace(prompt) == "" {
 		return messages
 	}
+
+	// Keep the runtime/tool system prompt as a separate first message. This avoids
+	// polluting durable working-memory system messages and prevents repeated
+	// prompt-appending across long sessions.
 	out := make([]Message, 0, len(messages)+1)
-	hasSystem := false
+	out = append(out, Message{Role: "system", Content: prompt})
 	for _, msg := range messages {
-		if msg.Role == "system" {
-			hasSystem = true
-			newContent := msg.Content
-			if !strings.Contains(msg.Content, "You have access to the following tools") {
-				newContent = msg.Content + "\n\n" + prompt
-			}
-			out = append(out, Message{Role: "system", Content: newContent})
-		} else {
-			out = append(out, msg)
+		if msg.Role == "system" && strings.TrimSpace(msg.Content) == strings.TrimSpace(prompt) {
+			continue
 		}
-	}
-	if !hasSystem {
-		out = append([]Message{{Role: "system", Content: prompt}}, out...)
+		out = append(out, msg)
 	}
 	return out
 }

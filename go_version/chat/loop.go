@@ -24,6 +24,7 @@ type ChatLoop struct {
 	client                *ollama.Client
 	db                    *db.Pool
 	currentConversationID *int // Tracks the active conversation ID
+	lastMessageID         int  // Last persisted message ID for checkpoint boundaries
 	messages              []ollama.Message
 	mu                    sync.Mutex
 	scanner               *bufio.Scanner
@@ -58,14 +59,18 @@ func (cl *ChatLoop) Run(ctx context.Context) error {
 		}
 	}
 
-	// Initial DB State Setup
+	// Initial DB State Setup. Resume the latest session from the newest durable
+	// working-memory/checkpoint snapshot plus only the recent messages after it.
 	if cl.cfg.PersistToDB && cl.db != nil {
-		// Try to find the most recent conversation to resume or create new one later
 		sessions, err := cl.db.ListSessions(ctx)
 		if err == nil && len(sessions) > 0 {
 			latestID := sessions[0].ID
 			cl.currentConversationID = &latestID
-			fmt.Fprintf(os.Stderr, "Resuming latest session: %d\n", latestID)
+			if err := cl.loadSessionCompact(ctx, latestID); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not compact-resume session %d: %v\n", latestID, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "Resuming latest session: %d (%d active context messages)\n", latestID, len(cl.messages))
+			}
 		} else {
 			fmt.Fprintln(os.Stderr, "No previous sessions found. Will create new upon first message.")
 		}
@@ -129,7 +134,11 @@ func (cl *ChatLoop) Run(ctx context.Context) error {
 			}
 
 			if cl.currentConversationID != nil {
-				cl.db.SaveMessage(ctx, *cl.currentConversationID, "user", prompt)
+				if msgID, err := cl.db.SaveMessageID(ctx, *cl.currentConversationID, "user", prompt); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not save user message: %v\n", err)
+				} else if msgID != nil {
+					cl.lastMessageID = *msgID
+				}
 			}
 		}
 
@@ -137,6 +146,10 @@ func (cl *ChatLoop) Run(ctx context.Context) error {
 			Role:    "user",
 			Content: prompt,
 		})
+
+		// Preflight compaction before the next model call. Post-turn compaction is
+		// too late for very large prompts/tool histories.
+		cl.compactIfNeeded(ctx)
 
 		cl.mu.Lock()
 		localMessages := make([]ollama.Message, len(cl.messages))
@@ -160,7 +173,8 @@ func (cl *ChatLoop) chatTurn(ctx context.Context, messages []ollama.Message) err
 	hasSpawnAgent := cl.cfg.MaxSubagentDepth > 0
 
 	toolPrompt := ollama.BuildSystemPrompt(hasTools, hasSpawnAgent)
-	chatMessages := ollama.InsertSystemPrompt(messages, toolPrompt)
+	basePrompt := strings.TrimSpace(strings.Join([]string{cl.cfg.SystemPrompt, toolPrompt}, "\n\n"))
+	chatMessages := ollama.InsertSystemPrompt(messages, basePrompt)
 
 	opts := cl.cfg.BuildOptions(cl.cfg.Model)
 
@@ -190,6 +204,7 @@ func (cl *ChatLoop) chatTurn(ctx context.Context, messages []ollama.Message) err
 		turnLimit = 100
 	}
 	for i := 0; i < turnLimit; i++ {
+		chatMessages = cl.compactLocalIfNeeded(ctx, chatMessages)
 		result := cl.processTurn(ctx, chatMessages, ollamaTools, opts, messages)
 		if result.err != nil {
 			return result.err
@@ -257,16 +272,8 @@ func (cl *ChatLoop) processTurn(
 	chatMessages = append(chatMessages, assistantMsg)
 	cl.mu.Lock()
 	cl.messages = append(cl.messages, assistantMsg)
-
-	// Persist Assistant Message if DB is enabled and we have a conversation ID
-	if cl.cfg.PersistToDB && cl.db != nil && cl.currentConversationID != nil {
-		go func(id int, msg ollama.Message) {
-			if err := cl.db.SaveMessage(context.Background(), id, "assistant", msg.Content); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to save assistant message: %v\n", err)
-			}
-		}(*cl.currentConversationID, assistantMsg)
-	}
 	cl.mu.Unlock()
+	cl.persistMessage(ctx, "assistant", assistantMsg.Content)
 
 	if len(assistantMsg.ToolCalls) == 0 {
 		return turnResult{done: true, messages: chatMessages}
@@ -292,7 +299,8 @@ func (cl *ChatLoop) processTurn(
 		if toolErr != nil {
 			result = fmt.Sprintf("Error: %v", toolErr)
 		}
-		toolResultPreview := result
+		modelResult := cl.maybeStoreArtifact(ctx, tc.Function.Name, string(tc.Function.Arguments), result)
+		toolResultPreview := modelResult
 		if len(toolResultPreview) > 120 {
 			toolResultPreview = toolResultPreview[:120] + "…"
 		}
@@ -300,21 +308,14 @@ func (cl *ChatLoop) processTurn(
 
 		toolMsg := ollama.Message{
 			Role:    "tool",
-			Content: result,
+			Content: modelResult,
 		}
 		chatMessages = append(chatMessages, toolMsg)
 		cl.mu.Lock()
 		cl.messages = append(cl.messages, toolMsg)
-
-		// Persist Tool Message if DB is enabled
-		if cl.cfg.PersistToDB && cl.db != nil && cl.currentConversationID != nil {
-			go func(id int, msg ollama.Message) {
-				if err := cl.db.SaveMessage(context.Background(), id, "tool", msg.Content); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to save tool message: %v\n", err)
-				}
-			}(*cl.currentConversationID, toolMsg)
-		}
 		cl.mu.Unlock()
+		cl.persistMessage(ctx, "tool", toolMsg.Content)
+
 	}
 
 	return turnResult{messages: chatMessages}
@@ -379,12 +380,16 @@ func (cl *ChatLoop) handleCommand(ctx context.Context, input string) error {
   /help       Show this help
   /exit       Exit the program
   /clear      Clear message history
-  /save       Save conversation (explicit update)
-  /export     Export conversation as JSON
-  /sessions   List saved sessions
-  /load <id>  Load a saved session
-  /model      Show current model
-  /history    Show message history count
+  /save          Save conversation metadata
+  /checkpoint    Save a durable working-memory checkpoint
+  /status        Show context/session status
+  /export        Export active context as JSON
+  /sessions      List saved sessions
+  /load <id>     Load a saved session from latest snapshot + recent messages
+  /artifacts     List recent large tool-output artifacts
+  /artifact <id> Print a stored artifact
+  /model         Show current model
+  /history       Show message history count
 `)
 	case "exit", "quit":
 		os.Exit(0)
@@ -449,27 +454,62 @@ func (cl *ChatLoop) handleCommand(ctx context.Context, input string) error {
 			return nil
 		}
 
-		msgs, err := cl.db.ExportSession(ctx, sessionID)
-		if err != nil {
+		if err := cl.loadSessionCompact(ctx, sessionID); err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading session %d: %v\n", sessionID, err)
 			return nil
 		}
+		cl.currentConversationID = &sessionID
+		fmt.Fprintf(os.Stderr, "Loaded session %d (%d active context messages, last message id %d).\n", sessionID, len(cl.messages), cl.lastMessageID)
 
-		// Clear current messages and load new ones
-		cl.mu.Lock()
-		cl.messages = make([]ollama.Message, len(msgs))
-		for i, m := range msgs {
-			cl.messages[i] = ollama.Message{
-				Role:    m.Role,
-				Content: m.Content,
+	case "checkpoint":
+		if err := cl.saveCheckpoint(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Checkpoint error: %v\n", err)
+			return nil
+		}
+	case "status":
+		fmt.Fprint(os.Stderr, cl.statusString())
+	case "artifacts":
+		if cl.db == nil {
+			fmt.Fprintln(os.Stderr, "Database not available.")
+			return nil
+		}
+		artifacts, err := cl.db.ListArtifacts(ctx, cl.currentConversationID, 20)
+		if err != nil {
+			return err
+		}
+		if len(artifacts) == 0 {
+			fmt.Fprintln(os.Stderr, "No artifacts.")
+			return nil
+		}
+		for _, a := range artifacts {
+			fmt.Fprintf(os.Stderr, "  #%d %s %s (%d bytes) %s\n", a.ID, a.Kind, a.Name, a.SizeBytes, a.CreatedAt.Format("2006-01-02 15:04"))
+			if strings.TrimSpace(a.Summary) != "" {
+				fmt.Fprintf(os.Stderr, "      %s\n", firstLine(a.Summary))
 			}
 		}
-		cl.mu.Unlock()
-
-		// Set the active conversation ID so future messages go to this session
-		cl.currentConversationID = &sessionID
-
-		fmt.Fprintf(os.Stderr, "Loaded session %d (%d messages). Messages restored.\n", sessionID, len(msgs))
+	case "artifact":
+		if len(parts) < 2 {
+			fmt.Fprintln(os.Stderr, "Usage: /artifact <id>")
+			return nil
+		}
+		if cl.db == nil {
+			fmt.Fprintln(os.Stderr, "Database not available.")
+			return nil
+		}
+		var artifactID int
+		if _, err := fmt.Sscanf(parts[1], "%d", &artifactID); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid artifact ID: %s\n", parts[1])
+			return nil
+		}
+		artifact, err := cl.db.GetArtifact(ctx, artifactID)
+		if err != nil {
+			return err
+		}
+		if artifact == nil {
+			fmt.Fprintf(os.Stderr, "Artifact %d not found.\n", artifactID)
+			return nil
+		}
+		fmt.Printf("Artifact #%d %s %s (%d bytes, sha256 %s)\n\n%s\n", artifact.ID, artifact.Kind, artifact.Name, artifact.SizeBytes, artifact.ContentHash, artifact.Content)
 
 	case "model":
 		fmt.Fprintf(os.Stderr, "Current model: %s\n", cl.cfg.Model)
@@ -484,11 +524,67 @@ func (cl *ChatLoop) handleCommand(ctx context.Context, input string) error {
 	return nil
 }
 
+func (cl *ChatLoop) effectiveContextLength() int {
+	if cl.cfg.NumCtx > 0 {
+		return cl.cfg.NumCtx
+	}
+	if cl.modelInfo != nil && cl.modelInfo.ContextLength > 0 {
+		return cl.modelInfo.ContextLength
+	}
+	return 0
+}
+
+func (cl *ChatLoop) compactTargetTokens() int {
+	contextLength := cl.effectiveContextLength()
+	if contextLength <= 0 {
+		return 0
+	}
+	target := cl.cfg.AutoCompactTarget
+	if target <= 0 || target >= cl.cfg.AutoCompactLimit {
+		target = 50
+	}
+	return contextLength * target / 100
+}
+
+func (cl *ChatLoop) compactKeepRecent() int {
+	if cl.cfg.AutoCompactKeepRecent > 0 {
+		return cl.cfg.AutoCompactKeepRecent
+	}
+	return 8
+}
+
+// compactLocalIfNeeded protects tool-call loops where local tool results can
+// grow beyond the context budget before the top-level cl.messages is compacted.
+func (cl *ChatLoop) compactLocalIfNeeded(ctx context.Context, msgs []ollama.Message) []ollama.Message {
+	if !cl.cfg.AutoCompact {
+		return msgs
+	}
+	contextLength := cl.effectiveContextLength()
+	if contextLength <= 0 || !ollama.ShouldCompact(msgs, contextLength, cl.cfg.AutoCompactLimit) {
+		return msgs
+	}
+
+	compacted, err := ollama.CompactMessagesWithOptions(ctx, cl.client, cl.cfg.Model, msgs, ollama.CompactOptions{
+		KeepRecent:       cl.compactKeepRecent(),
+		TargetTokens:     cl.compactTargetTokens(),
+		MaxSummaryTokens: contextLength / 10,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠ Local compact failed: %v\n", err)
+		return msgs
+	}
+	fmt.Fprintf(os.Stderr, "  ✓ Local context compacted for tool loop: %d → %d messages\n", len(msgs), len(compacted))
+	return compacted
+}
+
 // compactIfNeeded checks if the conversation is approaching the model's context
-// limit and compacts it if necessary. Uses the model itself to summarize older
-// messages, keeping recent context intact.
+// limit and compacts it into a structured working-memory snapshot.
 func (cl *ChatLoop) compactIfNeeded(ctx context.Context) {
-	if cl.modelInfo == nil || !cl.cfg.AutoCompact {
+	if !cl.cfg.AutoCompact {
+		return
+	}
+	contextLength := cl.effectiveContextLength()
+	if contextLength <= 0 {
 		return
 	}
 
@@ -497,16 +593,20 @@ func (cl *ChatLoop) compactIfNeeded(ctx context.Context) {
 	copy(msgs, cl.messages)
 	cl.mu.Unlock()
 
-	if !ollama.ShouldCompact(msgs, cl.modelInfo.ContextLength, cl.cfg.AutoCompactLimit) {
+	if !ollama.ShouldCompact(msgs, contextLength, cl.cfg.AutoCompactLimit) {
 		return
 	}
 
 	estimated := ollama.EstimateTokens(msgs)
-	fmt.Fprintf(os.Stderr, "\n  ⚡ Context: ~%d / %d tokens (%.0f%%) — compacting…\n",
-		estimated, cl.modelInfo.ContextLength,
-		float64(estimated)/float64(cl.modelInfo.ContextLength)*100)
+	fmt.Fprintf(os.Stderr, "\n  ⚡ Context: ~%d / %d tokens (%.0f%%) — compacting to working memory…\n",
+		estimated, contextLength,
+		float64(estimated)/float64(contextLength)*100)
 
-	compacted, err := ollama.CompactMessages(ctx, cl.client, cl.cfg.Model, msgs, 6)
+	compacted, err := ollama.CompactMessagesWithOptions(ctx, cl.client, cl.cfg.Model, msgs, ollama.CompactOptions{
+		KeepRecent:       cl.compactKeepRecent(),
+		TargetTokens:     cl.compactTargetTokens(),
+		MaxSummaryTokens: contextLength / 10,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  ⚠ Compact failed: %v\n", err)
 		return
@@ -517,8 +617,250 @@ func (cl *ChatLoop) compactIfNeeded(ctx context.Context) {
 	cl.mu.Unlock()
 
 	newEstimated := ollama.EstimateTokens(compacted)
-	fmt.Fprintf(os.Stderr, "  ✓ Compacted: %d → %d messages (~%d → ~%d tokens)\n\n",
+	fmt.Fprintf(os.Stderr, "  ✓ Compacted: %d → %d messages (~%d → ~%d tokens)\n",
 		len(msgs), len(compacted), estimated, newEstimated)
+	cl.persistWorkingMemorySnapshot(ctx, "working_memory", compacted, newEstimated)
+	fmt.Fprintln(os.Stderr)
+}
+
+func (cl *ChatLoop) persistMessage(ctx context.Context, role, content string) {
+	if !cl.cfg.PersistToDB || cl.db == nil || cl.currentConversationID == nil || content == "" {
+		return
+	}
+	msgID, err := cl.db.SaveMessageID(ctx, *cl.currentConversationID, role, content)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to save %s message: %v\n", role, err)
+		return
+	}
+	if msgID != nil {
+		cl.lastMessageID = *msgID
+	}
+}
+
+func (cl *ChatLoop) persistWorkingMemorySnapshot(ctx context.Context, kind string, messages []ollama.Message, tokenEstimate int) {
+	if cl.db == nil || cl.currentConversationID == nil {
+		return
+	}
+	memory := ollama.ExtractWorkingMemory(messages)
+	if strings.TrimSpace(memory) == "" {
+		return
+	}
+	messageIDThrough := cl.lastMessageID
+	if _, err := cl.db.SaveSnapshot(ctx, *cl.currentConversationID, &messageIDThrough, kind, memory, tokenEstimate); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to save %s snapshot: %v\n", kind, err)
+	}
+}
+
+func (cl *ChatLoop) saveCheckpoint(ctx context.Context) error {
+	if cl.db == nil || cl.currentConversationID == nil {
+		return fmt.Errorf("no active persisted conversation")
+	}
+
+	cl.mu.Lock()
+	msgs := make([]ollama.Message, len(cl.messages))
+	copy(msgs, cl.messages)
+	cl.mu.Unlock()
+
+	// Force a structured working memory update even if we are not at the compact
+	// threshold, so checkpoints are useful resume points.
+	compacted, err := ollama.CompactMessagesWithOptions(ctx, cl.client, cl.cfg.Model, msgs, ollama.CompactOptions{
+		KeepRecent:       cl.compactKeepRecent(),
+		TargetTokens:     cl.compactTargetTokens(),
+		MaxSummaryTokens: maxInt(cl.effectiveContextLength()/10, 1200),
+	})
+	if err != nil {
+		return err
+	}
+
+	memory := ollama.ExtractWorkingMemory(compacted)
+	if strings.TrimSpace(memory) == "" {
+		memory = manualCheckpointMemory(compacted)
+		compacted = append([]ollama.Message{{Role: "system", Content: ollama.WorkingMemoryPrefix + "\n" + memory}}, compacted...)
+	}
+
+	cl.mu.Lock()
+	cl.messages = compacted
+	cl.mu.Unlock()
+
+	messageIDThrough := cl.lastMessageID
+	if _, err := cl.db.SaveSnapshot(ctx, *cl.currentConversationID, &messageIDThrough, "checkpoint", memory, ollama.EstimateTokens(compacted)); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "Checkpoint saved for conversation %d at message %d.\n", *cl.currentConversationID, cl.lastMessageID)
+	return nil
+}
+
+func manualCheckpointMemory(messages []ollama.Message) string {
+	start := len(messages) - 20
+	if start < 0 {
+		start = 0
+	}
+	var sb strings.Builder
+	sb.WriteString("# Current Goal\n- Continue from the recent session context.\n")
+	sb.WriteString("# User Preferences / Constraints\n- None captured.\n")
+	sb.WriteString("# Repo Facts\n- None captured.\n")
+	sb.WriteString("# Important Files\n- None captured.\n")
+	sb.WriteString("# Decisions Made\n- None captured.\n")
+	sb.WriteString("# Changes Made\n- None captured.\n")
+	sb.WriteString("# Commands Run\n")
+	wroteCommand := false
+	for _, msg := range messages[start:] {
+		if msg.Role == "tool" {
+			wroteCommand = true
+			sb.WriteString("- ")
+			sb.WriteString(firstLine(msg.Content))
+			sb.WriteString("\n")
+		}
+	}
+	if !wroteCommand {
+		sb.WriteString("- None captured.\n")
+	}
+	sb.WriteString("# Failing Tests / Errors\n- None captured.\n")
+	sb.WriteString("# Artifacts\n- See /artifacts if large tool outputs were stored.\n")
+	sb.WriteString("# Open Questions\n- None captured.\n")
+	sb.WriteString("# Next Steps\n- Review recent messages and continue.\n")
+	return sb.String()
+}
+
+func (cl *ChatLoop) loadSessionCompact(ctx context.Context, sessionID int) error {
+	var messages []ollama.Message
+	cl.lastMessageID = 0
+	afterID := 0
+	if snap, err := cl.db.LatestSnapshot(ctx, sessionID, "checkpoint"); err != nil {
+		return err
+	} else if snap != nil {
+		messages = append(messages, ollama.Message{Role: "system", Content: ollama.WorkingMemoryPrefix + "\n" + snap.Content})
+		if snap.MessageIDThrough != nil {
+			afterID = *snap.MessageIDThrough
+		}
+	} else if snap, err := cl.db.LatestSnapshot(ctx, sessionID, "working_memory"); err != nil {
+		return err
+	} else if snap != nil {
+		messages = append(messages, ollama.Message{Role: "system", Content: ollama.WorkingMemoryPrefix + "\n" + snap.Content})
+		if snap.MessageIDThrough != nil {
+			afterID = *snap.MessageIDThrough
+		}
+	}
+
+	dbMessages, err := cl.db.ExportSessionAfterMessageID(ctx, sessionID, afterID)
+	if err != nil {
+		return err
+	}
+	for _, m := range dbMessages {
+		messages = append(messages, ollama.Message{Role: m.Role, Content: m.Content})
+		if m.ID > cl.lastMessageID {
+			cl.lastMessageID = m.ID
+		}
+	}
+	if len(dbMessages) == 0 && afterID > cl.lastMessageID {
+		cl.lastMessageID = afterID
+	}
+
+	cl.mu.Lock()
+	cl.messages = messages
+	cl.mu.Unlock()
+	return nil
+}
+
+func (cl *ChatLoop) maybeStoreArtifact(ctx context.Context, toolName, args, content string) string {
+	limit := cl.cfg.ToolResultMaxInline
+	if limit <= 0 {
+		limit = 12000
+	}
+	if len(content) <= limit {
+		return content
+	}
+
+	summary := summarizeToolOutput(content, 3000)
+	if cl.db == nil {
+		return fmt.Sprintf("Large %s tool result (%d bytes) was summarized because persistence is unavailable.\nArguments: %s\n\nSummary:\n%s", toolName, len(content), truncateArgs(args), summary)
+	}
+
+	name := fmt.Sprintf("%s %s", toolName, time.Now().Format("2006-01-02 15:04:05"))
+	artifact, err := cl.db.SaveArtifact(ctx, cl.currentConversationID, "tool_output", name, summary, content)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to save large tool output artifact: %v\n", err)
+		return fmt.Sprintf("Large %s tool result (%d bytes) could not be persisted; summarized inline.\nArguments: %s\n\nSummary:\n%s", toolName, len(content), truncateArgs(args), summary)
+	}
+	return fmt.Sprintf("Large %s tool result stored as artifact #%d (%d bytes, sha256 %s).\nArguments: %s\n\nSummary:\n%s\n\nUse /artifact %d to inspect the full output.", toolName, artifact.ID, artifact.SizeBytes, artifact.ContentHash, truncateArgs(args), summary, artifact.ID)
+}
+
+func summarizeToolOutput(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	keywords := []string{"error", "failed", "failure", "panic", "undefined", "cannot", "denied", "warning", "FAIL", "PASS", "modified", "created", "deleted"}
+	lines := strings.Split(s, "\n")
+	var picked []string
+	for _, line := range lines {
+		lower := strings.ToLower(line)
+		for _, kw := range keywords {
+			if strings.Contains(lower, strings.ToLower(kw)) {
+				picked = append(picked, line)
+				break
+			}
+		}
+		if len(strings.Join(picked, "\n")) > maxLen {
+			break
+		}
+	}
+	if len(picked) > 0 {
+		out := strings.Join(picked, "\n")
+		if len(out) > maxLen {
+			return out[:maxLen] + "…"
+		}
+		return out
+	}
+	headLen := maxLen / 2
+	tailLen := maxLen - headLen
+	return s[:headLen] + "\n... [middle omitted] ...\n" + s[len(s)-tailLen:]
+}
+
+func (cl *ChatLoop) statusString() string {
+	cl.mu.Lock()
+	count := len(cl.messages)
+	estimated := ollama.EstimateTokens(cl.messages)
+	memory := ollama.ExtractWorkingMemory(cl.messages)
+	cl.mu.Unlock()
+	contextLength := cl.effectiveContextLength()
+	var sb strings.Builder
+	sb.WriteString("Session status:\n")
+	if cl.currentConversationID != nil {
+		sb.WriteString(fmt.Sprintf("  Conversation: %d\n", *cl.currentConversationID))
+	} else {
+		sb.WriteString("  Conversation: none\n")
+	}
+	sb.WriteString(fmt.Sprintf("  Messages in active context: %d\n", count))
+	sb.WriteString(fmt.Sprintf("  Estimated tokens: %d", estimated))
+	if contextLength > 0 {
+		sb.WriteString(fmt.Sprintf(" / %d (%.0f%%)", contextLength, float64(estimated)/float64(contextLength)*100))
+	}
+	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("  Last persisted message ID: %d\n", cl.lastMessageID))
+	if strings.TrimSpace(memory) != "" {
+		sb.WriteString("  Working memory: present\n")
+	} else {
+		sb.WriteString("  Working memory: none yet\n")
+	}
+	return sb.String()
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if idx := strings.Index(s, "\n"); idx >= 0 {
+		s = s[:idx]
+	}
+	if len(s) > 100 {
+		return s[:100] + "…"
+	}
+	return s
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func truncateArgs(args string) string {

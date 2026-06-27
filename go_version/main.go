@@ -30,6 +30,9 @@ func main() {
 	depth := flag.Int("subagent-depth", -1, "Max subagent depth (0 to disable)")
 	rounds := flag.Int("subagent-rounds", -1, "Max subagent rounds")
 	turnLimit := flag.Int("turn-limit", -1, "Max tool-call turns per chat turn (0 = unlimited)")
+	autoCompactTarget := flag.Int("auto-compact-target", -1, "Target context percentage after compaction (env: AUTO_COMPACT_TARGET, default: 50)")
+	autoCompactKeepRecent := flag.Int("auto-compact-keep-recent", -1, "Messages to preserve verbatim during compaction (env: AUTO_COMPACT_KEEP_RECENT, default: 8)")
+	toolResultMaxInline := flag.Int("tool-result-max-inline", -1, "Max tool result bytes to keep inline before artifactizing (env: TOOL_RESULT_MAX_INLINE, default: 12000)")
 	numCtx := flag.Int("num-ctx", -1, "Override model context window in tokens (env: NUM_CTX, default: model native)")
 	help := flag.Bool("help", false, "Show help")
 
@@ -103,6 +106,15 @@ func main() {
 	}
 	if *turnLimit >= 0 {
 		cfg.TurnLimit = *turnLimit
+	}
+	if *autoCompactTarget >= 0 {
+		cfg.AutoCompactTarget = *autoCompactTarget
+	}
+	if *autoCompactKeepRecent > 0 {
+		cfg.AutoCompactKeepRecent = *autoCompactKeepRecent
+	}
+	if *toolResultMaxInline > 0 {
+		cfg.ToolResultMaxInline = *toolResultMaxInline
 	}
 	if *numCtx > 0 {
 		cfg.NumCtx = *numCtx
@@ -267,12 +279,18 @@ Flags:
   -subagent-depth <n>      Max subagent depth (env: MAX_SUBAGENT_DEPTH)
   -subagent-rounds <n>     Max subagent rounds (env: MAX_SUBAGENT_ROUNDS)
   -turn-limit <n>          Max tool-call turns per chat turn (env: TURN_LIMIT, default: 100)
+  -auto-compact-target <n> Target context percent after compaction (env: AUTO_COMPACT_TARGET, default: 50)
+  -auto-compact-keep-recent <n>
+                           Messages preserved verbatim during compaction (env: AUTO_COMPACT_KEEP_RECENT, default: 8)
+  -tool-result-max-inline <n>
+                           Max tool result bytes before artifact storage (env: TOOL_RESULT_MAX_INLINE, default: 12000)
   -num-ctx <n>             Override model context window in tokens (env: NUM_CTX, default: model native)
 
 Environment variables (in order of precedence: flag > env > yaml > default):
   OLLAMA_MODEL, OLLAMA_HOST, OLLAMA_MODEL_FALLBACKS, THINK,
   EXPERIMENTAL_WEBSEARCH, PERSIST_TO_DB, DATABASE_URL,
-  MAX_SUBAGENT_DEPTH, MAX_SUBAGENT_ROUNDS, TURN_LIMIT, CONTEXT_PATH, NUM_CTX
+  MAX_SUBAGENT_DEPTH, MAX_SUBAGENT_ROUNDS, TURN_LIMIT, CONTEXT_PATH, NUM_CTX,
+  AUTO_COMPACT_TARGET, AUTO_COMPACT_KEEP_RECENT, TOOL_RESULT_MAX_INLINE
 
 Tools available when websearch is enabled:
   web_search, read_file, write_file, append_file, list_directory,
@@ -302,6 +320,11 @@ Examples:
   persist_to_db: false
   max_subagent_depth: 1
   think: auto
+  auto_compact: true
+  auto_compact_limit: 75
+  auto_compact_target: 50
+  auto_compact_keep_recent: 8
+  tool_result_max_inline: 12000
 `)
 
 	fmt.Fprintf(os.Stderr, "\nDatabase (PostgreSQL):\n")

@@ -215,7 +215,10 @@ if [[ "$SKIP_CONFIG" != "true" ]]; then
     CFG_ROUNDS="${MAX_SUBAGENT_ROUNDS:-$(read_yaml "max_subagent_rounds" "10")}"
     CFG_TURNS="${TURN_LIMIT:-$(read_yaml "turn_limit" "100")}"
     CFG_AUTO_COMPACT="${AUTO_COMPACT:-$(read_yaml "auto_compact" "true")}"
-    CFG_AUTO_COMPACT_LIMIT="${AUTO_COMPACT_LIMIT:-$(read_yaml "auto_compact_limit" "80")}"
+    CFG_AUTO_COMPACT_LIMIT="${AUTO_COMPACT_LIMIT:-$(read_yaml "auto_compact_limit" "75")}"
+    CFG_AUTO_COMPACT_TARGET="${AUTO_COMPACT_TARGET:-$(read_yaml "auto_compact_target" "50")}"
+    CFG_AUTO_COMPACT_KEEP_RECENT="${AUTO_COMPACT_KEEP_RECENT:-$(read_yaml "auto_compact_keep_recent" "8")}"
+    CFG_TOOL_RESULT_MAX_INLINE="${TOOL_RESULT_MAX_INLINE:-$(read_yaml "tool_result_max_inline" "12000")}"
     CFG_NUM_CTX="${NUM_CTX:-$(read_yaml "num_ctx" "")}"
     CFG_DB_URL="${DATABASE_URL:-$(read_yaml "database_url" "")}"
     CFG_CONTEXT="${CONTEXT_PATH:-$(read_yaml "context_path" "")}"
@@ -236,6 +239,9 @@ max_subagent_rounds: ${CFG_ROUNDS}
 turn_limit: ${CFG_TURNS}
 auto_compact: ${CFG_AUTO_COMPACT}
 auto_compact_limit: ${CFG_AUTO_COMPACT_LIMIT}
+auto_compact_target: ${CFG_AUTO_COMPACT_TARGET}
+auto_compact_keep_recent: ${CFG_AUTO_COMPACT_KEEP_RECENT}
+tool_result_max_inline: ${CFG_TOOL_RESULT_MAX_INLINE}
 install_prefix: ${INSTALL_PREFIX}
 compiled: true
 YAMLEOF
