@@ -187,27 +187,24 @@ func startPostgresViaCompose(databaseURL string) bool {
 
 	fmt.Fprintf(os.Stderr, "  Running: %s -f %s up -d postgres (port %s)\n", composeCmd, composeFile, postgresPort)
 
+	// Remove any existing container with the target name so docker-compose
+	// can create a fresh one with the current configuration. This handles the
+	// case where a container was left behind by a previous run or created
+	// outside the compose project.
+	exec.Command("docker", "rm", "-f", "ollama-chat-db-go").Run()
+
 	var cmd *exec.Cmd
 	if composeCmd == "docker compose" {
-		cmd = exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "--force-recreate", "postgres")
+		cmd = exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "postgres")
 	} else {
-		cmd = exec.Command(composeCmd, "-f", composeFile, "up", "-d", "--force-recreate", "postgres")
+		cmd = exec.Command(composeCmd, "-f", composeFile, "up", "-d", "postgres")
 	}
 	cmd.Env = append(os.Environ(), "POSTGRES_PORT="+postgresPort)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// If --force-recreate fails, try removing the container and starting fresh
-		fmt.Fprintf(os.Stderr, "  Recreating container failed, attempting cleanup...\n")
-		if composeCmd == "docker compose" {
-			exec.Command("docker", "compose", "-f", composeFile, "rm", "-f", "postgres").Run()
-			cmd = exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "postgres")
-		} else {
-			exec.Command(composeCmd, "-f", composeFile, "rm", "-f", "postgres").Run()
-			cmd = exec.Command(composeCmd, "-f", composeFile, "up", "-d", "postgres")
-		}
-		cmd.Env = append(os.Environ(), "POSTGRES_PORT="+postgresPort)
-		output, err = cmd.CombinedOutput()
+		fmt.Fprintf(os.Stderr, "  Failed to start Postgres: %s\n", strings.TrimSpace(string(output)))
+		return false
 	}
 
 	fmt.Fprintf(os.Stderr, "  %s", strings.TrimSpace(string(output)))
